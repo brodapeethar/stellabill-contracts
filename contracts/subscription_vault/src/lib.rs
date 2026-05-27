@@ -1,310 +1,126 @@
 #![no_std]
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Symbol};
 
-#[contracttype]
-#[derive(Clone, PartialEq, Eq)]
-pub enum SubscriptionStatus {
-    Active,
-    Paused,
-    Cancelled,
-    InsufficientBalance,
+pub const MAX_SUBSCRIPTION_ID: u32 = u32::MAX;
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum Error {
+    NotFound = 404,
+    InvalidArgument = 3,
+    SubscriptionLimitReached = 429,
 }
 
 #[contracttype]
-#[derive(Clone)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SubscriptionStatus {
+    Active = 0,
+    Paused = 1,
+    Cancelled = 2,
+    InsufficientBalance = 3,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Subscription {
+    pub subscriber: Address,
+    pub token: Address,
     pub merchant: Address,
     pub amount: i128,
     pub interval_seconds: u64,
     pub last_payment_timestamp: u64,
     pub status: SubscriptionStatus,
     pub prepaid_balance: i128,
+    pub usage_enabled: bool,
+    pub expires_at: Option<u64>,
 }
-
-#[contracttype]
-#[derive(Clone)]
-pub enum DataKey {
-    Subscription(u32),
-    MerchantBalance(Address),
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct ChargeExecutionResult {
-    pub success: bool,
-}
-
-#[contracterror]
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub enum Error {
-    NotFound,
-    NotActive,
-    IntervalNotElapsed,
-    InsufficientBalance,
-    Overflow,
-    InvalidInterval,
-}
-
-const MIN_SUBSCRIPTION_INTERVAL_SECONDS: u64 = 60;
-const MAX_SUBSCRIPTION_INTERVAL_SECONDS: u64 = 31_536_000;
 
 #[contract]
 pub struct SubscriptionVault;
 
 #[contractimpl]
 impl SubscriptionVault {
-    pub fn version(_env: Env) -> u32 {
-        0
+    pub fn init(env: Env, admin: Address, default_token: Address) {
+        env.storage().instance().set(&Symbol::new(&env, "admin"), &admin);
+        env.storage().instance().set(&Symbol::new(&env, "token"), &default_token);
     }
 
     pub fn create_subscription(
         env: Env,
-        subscription_id: u32,
+        subscriber: Address,
         merchant: Address,
         amount: i128,
         interval_seconds: u64,
-        initial_balance: i128,
-    ) -> Result<(), Error> {
-        validate_interval(interval_seconds)?;
-        if amount < 0 || initial_balance < 0 {
-            return Err(Error::InvalidInterval);
+        usage_enabled: bool,
+        expires_at: Option<u64>,
+    ) -> Result<u32, Error> {
+        subscriber.require_auth();
+
+        if amount <= 0 {
+            return Err(Error::InvalidArgument);
+        }
+        if interval_seconds == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        if let Some(ts) = expires_at {
+            if ts <= env.ledger().timestamp() {
+                return Err(Error::InvalidArgument);
+            }
         }
 
-        let now = env.ledger().timestamp();
-        let subscription = Subscription {
+        let token: Address = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(&env, "token"))
+            .ok_or(Error::NotFound)?;
+
+        let id = Self::_next_id(&env)?;
+        let sub = Subscription {
+            subscriber,
+            token,
             merchant,
             amount,
             interval_seconds,
-            last_payment_timestamp: now,
+            last_payment_timestamp: env.ledger().timestamp(),
             status: SubscriptionStatus::Active,
-            prepaid_balance: initial_balance,
+            prepaid_balance: 0,
+            usage_enabled,
+            expires_at,
         };
-        env.storage()
-            .persistent()
-            .set(&DataKey::Subscription(subscription_id), &subscription);
-        Ok(())
+        env.storage().instance().set(&id, &sub);
+        Ok(id)
     }
 
-    pub fn charge_subscription(
-        env: Env,
-        subscription_id: u32,
-    ) -> Result<ChargeExecutionResult, Error> {
-        let mut subscription = load_subscription(&env, subscription_id)?;
-
-        if subscription.status != SubscriptionStatus::Active {
-            return Err(Error::NotActive);
-        }
-
-        let next_charge_time = subscription
-            .last_payment_timestamp
-            .checked_add(subscription.interval_seconds)
-            .ok_or(Error::Overflow)?;
-
-        let now = env.ledger().timestamp();
-        if now < next_charge_time {
-            return Err(Error::IntervalNotElapsed);
-        }
-
-        if subscription.prepaid_balance < subscription.amount {
-            subscription.status = SubscriptionStatus::InsufficientBalance;
-            env.storage()
-                .persistent()
-                .set(&DataKey::Subscription(subscription_id), &subscription);
-            return Err(Error::InsufficientBalance);
-        }
-
-        subscription.prepaid_balance = subscription
-            .prepaid_balance
-            .checked_sub(subscription.amount)
-            .ok_or(Error::Overflow)?;
-        subscription.last_payment_timestamp = now;
-
+    pub fn get_subscription(env: Env, id: u32) -> Result<Subscription, Error> {
         env.storage()
-            .persistent()
-            .set(&DataKey::Subscription(subscription_id), &subscription);
-
-        credit_merchant(&env, &subscription.merchant, subscription.amount)?;
-
-        Ok(ChargeExecutionResult { success: true })
+            .instance()
+            .get(&id)
+            .ok_or(Error::NotFound)
     }
 
-    pub fn merchant_balance(env: Env, merchant: Address) -> i128 {
+    pub fn get_subscription_count(env: Env) -> u32 {
         env.storage()
-            .persistent()
-            .get(&DataKey::MerchantBalance(merchant))
+            .instance()
+            .get(&Symbol::new(&env, "next_id"))
             .unwrap_or(0)
     }
-}
 
-fn load_subscription(env: &Env, subscription_id: u32) -> Result<Subscription, Error> {
-    env.storage()
-        .persistent()
-        .get(&DataKey::Subscription(subscription_id))
-        .ok_or(Error::NotFound)
-}
-
-fn credit_merchant(env: &Env, merchant: &Address, amount: i128) -> Result<(), Error> {
-    let current: i128 = env
-        .storage()
-        .persistent()
-        .get(&DataKey::MerchantBalance(merchant.clone()))
-        .unwrap_or(0);
-    let updated = current.checked_add(amount).ok_or(Error::Overflow)?;
-    env.storage()
-        .persistent()
-        .set(&DataKey::MerchantBalance(merchant.clone()), &updated);
-    Ok(())
-}
-
-fn validate_interval(interval_seconds: u64) -> Result<(), Error> {
-    if interval_seconds < MIN_SUBSCRIPTION_INTERVAL_SECONDS
-        || interval_seconds > MAX_SUBSCRIPTION_INTERVAL_SECONDS
-    {
-        return Err(Error::InvalidInterval);
+    pub fn version(_env: Env) -> u32 {
+        0
     }
-    Ok(())
+
+    fn _next_id(env: &Env) -> Result<u32, Error> {
+        let key = Symbol::new(env, "next_id");
+        let current: u32 = env.storage().instance().get(&key).unwrap_or(0);
+        if current == MAX_SUBSCRIPTION_ID {
+            return Err(Error::SubscriptionLimitReached);
+        }
+        env.storage().instance().set(&key, &(current + 1));
+        Ok(current)
+    }
 }
 
 #[cfg(test)]
-mod test {
-    use super::*;
-    use soroban_sdk::{testutils::Ledger, Address, BytesN, Env};
-
-    fn account_id(env: &Env, nonce: u8) -> Address {
-        let mut bytes = [0u8; 32];
-        bytes[0] = nonce;
-        Address::from_account_id(&BytesN::from_array(env, &bytes))
-    }
-
-    fn set_ledger_timestamp(env: &Env, timestamp: u64) {
-        env.ledger().set(Ledger {
-            timestamp,
-            sequence_number: timestamp as i32,
-            protocol_version: 1,
-        });
-    }
-
-    #[test]
-    fn charge_subscription_deducts_balance_and_credits_merchant() {
-        let env = Env::default();
-        let contract_id = env.register(SubscriptionVault, ());
-        let client = SubscriptionVaultClient::new(&env, &contract_id);
-
-        set_ledger_timestamp(&env, 1);
-        let merchant = account_id(&env, 1);
-        client
-            .create_subscription(1, merchant.clone(), 25, 60, 100)
-            .unwrap();
-
-        set_ledger_timestamp(&env, 61);
-        let result = client.charge_subscription(1);
-        assert_eq!(result.unwrap().success, true);
-        assert_eq!(client.merchant_balance(merchant.clone()), 25);
-
-        let subscription: Subscription = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Subscription(1))
-            .unwrap();
-        assert_eq!(subscription.prepaid_balance, 75);
-        assert_eq!(subscription.last_payment_timestamp, 61);
-        assert_eq!(subscription.status, SubscriptionStatus::Active);
-    }
-
-    #[test]
-    fn charge_subscription_rejects_before_interval() {
-        let env = Env::default();
-        let contract_id = env.register(SubscriptionVault, ());
-        let client = SubscriptionVaultClient::new(&env, &contract_id);
-
-        set_ledger_timestamp(&env, 1);
-        let merchant = account_id(&env, 2);
-        client
-            .create_subscription(2, merchant, 30, 60, 100)
-            .unwrap();
-
-        set_ledger_timestamp(&env, 60);
-        let err = client.charge_subscription(2).unwrap_err();
-        assert_eq!(err, Error::IntervalNotElapsed);
-    }
-
-    #[test]
-    fn charge_subscription_allows_exact_balance_to_zero() {
-        let env = Env::default();
-        let contract_id = env.register(SubscriptionVault, ());
-        let client = SubscriptionVaultClient::new(&env, &contract_id);
-
-        set_ledger_timestamp(&env, 1);
-        let merchant = account_id(&env, 3);
-        client
-            .create_subscription(3, merchant.clone(), 50, 60, 50)
-            .unwrap();
-
-        set_ledger_timestamp(&env, 61);
-        let result = client.charge_subscription(3).unwrap();
-        assert_eq!(result.success, true);
-        assert_eq!(client.merchant_balance(merchant), 50);
-
-        let subscription: Subscription = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Subscription(3))
-            .unwrap();
-        assert_eq!(subscription.prepaid_balance, 0);
-        assert_eq!(subscription.status, SubscriptionStatus::Active);
-    }
-
-    #[test]
-    fn charge_subscription_sets_insufficient_balance_when_funds_are_low() {
-        let env = Env::default();
-        let contract_id = env.register(SubscriptionVault, ());
-        let client = SubscriptionVaultClient::new(&env, &contract_id);
-
-        set_ledger_timestamp(&env, 1);
-        let merchant = account_id(&env, 4);
-        client
-            .create_subscription(4, merchant.clone(), 40, 60, 20)
-            .unwrap();
-
-        set_ledger_timestamp(&env, 61);
-        let err = client.charge_subscription(4).unwrap_err();
-        assert_eq!(err, Error::InsufficientBalance);
-        assert_eq!(client.merchant_balance(merchant), 0);
-
-        let subscription: Subscription = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Subscription(4))
-            .unwrap();
-        assert_eq!(subscription.prepaid_balance, 20);
-        assert_eq!(subscription.status, SubscriptionStatus::InsufficientBalance);
-    }
-
-    #[test]
-    fn charge_subscription_rejects_non_active_status() {
-        let env = Env::default();
-        let contract_id = env.register(SubscriptionVault, ());
-        let client = SubscriptionVaultClient::new(&env, &contract_id);
-
-        set_ledger_timestamp(&env, 1);
-        let merchant = account_id(&env, 5);
-        client
-            .create_subscription(5, merchant.clone(), 10, 60, 100)
-            .unwrap();
-
-        let mut subscription: Subscription = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Subscription(5))
-            .unwrap();
-        subscription.status = SubscriptionStatus::Paused;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Subscription(5), &subscription);
-
-        set_ledger_timestamp(&env, 61);
-        let err = client.charge_subscription(5).unwrap_err();
-        assert_eq!(err, Error::NotActive);
-    }
-}
+mod test;
