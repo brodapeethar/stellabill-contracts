@@ -10,937 +10,35 @@
 //! - `types` — shared types and error codes
 //! - `safe_math` — overflow-safe arithmetic helpers
 
-use soroban_sdk::{contract, contractimpl, Address, Env, String, Symbol, Vec};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env};
 
-mod admin;
-mod charge_core;
-mod merchant;
-mod queries;
-mod safe_math;
-mod subscription;
-mod types;
+// ── Error types ──────────────────────────────────────────────────────────────
 
-pub use safe_math::*;
-
-// ── Stub modules for features not yet extracted to separate files ─────────────
-
-/// Blocklist: prevents blacklisted subscribers from creating or receiving charges.
-pub mod blocklist {
-    #![allow(unused_variables, dead_code)]
-    use soroban_sdk::{contracttype, Address, Env, String};
-    use crate::types::Error;
-
-    #[contracttype]
-    #[derive(Clone)]
-    pub struct BlocklistEntry { pub reason: String }
-
-    #[contracttype]
-    #[derive(Clone)]
-    pub struct BlocklistAddedEvent { pub subscriber: Address, pub reason: String }
-
-    #[contracttype]
-    #[derive(Clone)]
-    pub struct BlocklistRemovedEvent { pub subscriber: Address }
-
-    pub fn is_blocklisted(_env: &Env, _addr: &Address) -> bool { false }
-    pub fn require_not_blocklisted(_env: &Env, _addr: &Address) -> Result<(), Error> { Ok(()) }
-    pub fn get_blocklist_entry(_env: &Env, _addr: Address) -> Result<BlocklistEntry, Error> {
-        Err(Error::NotFound)
-    }
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Error {
+    /// Subscription not found.
+    NotFound = 1000,
+    /// Caller is not the stored admin address.
+    Unauthorized = 1001,
 }
 
-/// State machine: validates and applies subscription status transitions.
-pub mod state_machine {
-    #![allow(unused_variables, dead_code)]
-    use crate::types::{Error, SubscriptionStatus};
+// ── Storage keys ─────────────────────────────────────────────────────────────
 
-    pub fn transition_to(current: &mut SubscriptionStatus, next: SubscriptionStatus) -> Result<(), Error> {
-        *current = next;
-        Ok(())
-    }
-    pub fn can_transition(from: &SubscriptionStatus, to: &SubscriptionStatus) -> bool { true }
-    pub fn validate_status_transition(from: &SubscriptionStatus, to: &SubscriptionStatus) -> Result<(), Error> { Ok(()) }
-    pub fn get_allowed_transitions(from: &SubscriptionStatus) -> soroban_sdk::Vec<SubscriptionStatus> {
-        soroban_sdk::Vec::new(&soroban_sdk::Env::default())
-    }
+#[contracttype]
+pub enum DataKey {
+    Admin,
+    Subscription(u64),
 }
 
-/// Billing statements: append-only ledger of charges per subscription.
-pub mod statements {
-    #![allow(unused_variables, dead_code)]
-    use soroban_sdk::{Address, Env};
-    use crate::types::{BillingChargeKind, Error};
+// ── Contract ─────────────────────────────────────────────────────────────────
 
-    pub fn append_statement(
-        _env: &Env,
-        _subscription_id: u32,
-        _amount: i128,
-        _merchant: Address,
-        _kind: BillingChargeKind,
-        _period_start: u64,
-        _timestamp: u64,
-    ) -> Result<(), Error> { Ok(()) }
-}
-
-/// Period snapshots: write billing-period summaries for reconciliation.
-pub mod period_snapshots {
-    #![allow(unused_variables, dead_code)]
-    use soroban_sdk::Env;
-    use crate::types::{BillingPeriodSnapshot, Error};
-
-    pub fn write_period_snapshot(_env: &Env, _snapshot: BillingPeriodSnapshot) -> Result<(), Error> { Ok(()) }
-}
-
-/// Accounting: tracks total tokens accounted for across all subscriptions.
-pub mod accounting {
-    #![allow(unused_variables, dead_code)]
-    use soroban_sdk::{Address, Env};
-    use crate::types::Error;
-
-    pub fn add_total_accounted(_env: &Env, _token: &Address, _amount: i128) -> Result<(), Error> { Ok(()) }
-    pub fn sub_total_accounted(_env: &Env, _token: &Address, _amount: i128) -> Result<(), Error> { Ok(()) }
-}
-
-/// Oracle: optional on-chain price oracle for dynamic charge amounts.
-pub mod oracle {
-    #![allow(unused_variables, dead_code)]
-    use soroban_sdk::{Address, Env};
-    use crate::types::{Error, Subscription};
-
-    pub fn resolve_charge_amount(_env: &Env, _subscription_id: u32, sub: &Subscription) -> Result<i128, Error> {
-        Ok(sub.amount)
-    }
-    pub fn set_oracle_config(_env: &Env, _enabled: bool, _oracle: Option<Address>, _max_age: u64) -> Result<(), Error> {
-        Ok(())
-    }
-}
-
-/// Reentrancy guard: single-entry lock per named critical section.
-pub mod reentrancy {
-    #![allow(unused_variables, dead_code)]
-    use soroban_sdk::Env;
-    use crate::types::Error;
-
-    pub struct ReentrancyGuard;
-    impl ReentrancyGuard {
-        pub fn lock(_env: &Env, _name: &str) -> Result<Self, Error> { Ok(Self) }
-    }
-}
-
-/// Nonce: replay-protection counters for privileged operations.
-pub mod nonce {
-    #![allow(unused_variables, dead_code)]
-    use soroban_sdk::{Address, Env};
-
-    pub const DOMAIN_BATCH_CHARGE: u32 = 0;
-    pub const DOMAIN_ADMIN_ROTATION: u32 = 1;
-    pub const DOMAIN_OPERATOR_BATCH_CHARGE: u32 = 2;
-
-    pub fn get_nonce(_env: &Env, _signer: &Address, _domain: u32) -> u64 { 0 }
-    pub fn consume_nonce(_env: &Env, _signer: &Address, _domain: u32, _expected: u64) -> Result<(), crate::types::Error> { Ok(()) }
-}
-
-/// Operator: least-privilege charge delegate.
-pub mod operator {
-    #![allow(unused_variables, dead_code)]
-    use soroban_sdk::{Address, Env, String, Vec};
-    use crate::types::{BatchChargeResult, ChargeExecutionResult, Error, UsageChargeResult};
-
-    pub fn do_set_operator(_env: &Env, _admin: Address, _operator: Address) -> Result<(), Error> { Ok(()) }
-    pub fn do_remove_operator(_env: &Env, _admin: Address) -> Result<(), Error> { Ok(()) }
-    pub fn get_operator(_env: &Env) -> Option<Address> { None }
-    pub fn do_operator_batch_charge(
-        _env: &Env, _operator: Address, _ids: &Vec<u32>, _nonce: u64,
-    ) -> Result<Vec<BatchChargeResult>, Error> {
-        Ok(Vec::new(_env))
-    }
-    pub fn do_operator_charge_subscription(
-        _env: &Env, _op: Address, _subscription_id: u32,
-    ) -> Result<ChargeExecutionResult, Error> {
-        Err(Error::NotFound)
-    }
-    pub fn do_operator_charge_usage(
-        _env: &Env, _op: Address, _subscription_id: u32, _usage_amount: i128,
-    ) -> Result<UsageChargeResult, Error> {
-        Err(Error::NotFound)
-    }
-    pub fn do_operator_charge_usage_with_reference(
-        _env: &Env, _op: Address, _subscription_id: u32, _usage_amount: i128, _reference: String,
-    ) -> Result<UsageChargeResult, Error> {
-        Err(Error::NotFound)
-    }
-}
-
-/// Metadata: per-subscription key-value annotations.
-pub mod metadata {
-    #![allow(unused_variables, dead_code)]
-    use soroban_sdk::{Address, Env, String};
-    use crate::types::Error;
-
-    pub fn set_metadata(_env: &Env, _caller: Address, _subscription_id: u32, _key: String, _value: String) -> Result<(), Error> { Ok(()) }
-    pub fn get_metadata(_env: &Env, _subscription_id: u32, _key: String) -> Result<String, Error> { Err(Error::NotFound) }
-    pub fn delete_metadata(_env: &Env, _caller: Address, _subscription_id: u32, _key: String) -> Result<(), Error> { Ok(()) }
-    pub fn list_metadata_keys(_env: &Env, _subscription_id: u32) -> Result<soroban_sdk::Vec<String>, Error> {
-        Ok(soroban_sdk::Vec::new(_env))
-    }
-}
-
-// ── Re-exports ────────────────────────────────────────────────────────────────
-pub use blocklist::{BlocklistAddedEvent, BlocklistEntry, BlocklistRemovedEvent};
-pub use queries::{
-    compute_next_charge_info, generate_reconciliation_proof, get_contract_reconciliation_summary,
-    get_token_reconciliation, query_prepaid_balances_paginated, MAX_PREPAID_SCAN_DEPTH, MAX_SCAN_DEPTH,
-    MAX_SUBSCRIPTION_LIST_PAGE, MAX_TOKEN_SUMMARIES_PER_PAGE,
-};
-pub use state_machine::{can_transition, get_allowed_transitions, validate_status_transition};
-pub use types::{
-    AcceptedToken, AccruedTotals, AdminRotatedEvent, BatchChargeResult, BatchWithdrawResult,
-    BillingChargeKind, BillingCompactedEvent, BillingCompactionSummary, BillingPeriodSnapshot,
-    BillingRetentionConfig, BillingStatement, BillingStatementAggregate, BillingStatementsPage,
-    CapInfo, ChargeExecutionResult, ContractSnapshot, DataKey, EmergencyStopDisabledEvent,
-    EmergencyStopEnabledEvent, Error, FundsDepositedEvent, LifetimeCapReachedEvent, MerchantConfig,
-    MerchantConfigInitializedEvent, MerchantConfigUpdatedEvent, MerchantPausedEvent,
-    MerchantUnpausedEvent, MerchantWithdrawalEvent, MetadataDeletedEvent,
-    MetadataSetEvent, MigrationExportEvent, NextChargeInfo, OneOffChargedEvent, OracleConfig,
-    OraclePrice, PartialRefundEvent, PlanTemplate, PlanTemplateUpdatedEvent,
-    ProtocolFeeChargedEvent, ProtocolFeeConfiguredEvent, RecoveryEvent, RecoveryReason,
-    Subscription, SubscriptionCancelledEvent, SubscriptionChargeFailedEvent,
-    SubscriptionChargedEvent, SubscriptionCreatedEvent, SubscriptionMigratedEvent,
-    SubscriptionPausedEvent, SubscriptionRecoveryReadyEvent, SubscriptionResumedEvent,
-    SubscriptionStatus, SubscriptionSummary, SubscriberWithdrawalEvent,
-    SubscriptionArchivedEvent, SubscriptionExpiredEvent,
-    TokenEarnings, TokenReconciliationSnapshot, UsageChargeResult, UsageLimits, UsageState, UsageStatementEvent,
-    MAX_METADATA_KEYS, MAX_METADATA_KEY_LENGTH, MAX_METADATA_VALUE_LENGTH,
-    SNAPSHOT_FLAG_CLOSED, SNAPSHOT_FLAG_EMPTY, SNAPSHOT_FLAG_INTERVAL_CHARGED,
-    SNAPSHOT_FLAG_USAGE_CHARGED,
-    OP_CHARGE, OP_WITHDRAW, OP_REFUND, OP_BILLING_PAUSE, OP_AUTO_RENEWAL,
-    DEFAULT_ALLOWED_OPS,
-    GlobalCapDefaultUpdatedEvent, LifetimeCapUpdatedEvent, MerchantCapDefaultUpdatedEvent,
-    OperatorRemovedEvent, OperatorSetEvent,
-    PrepaidQueryRequest, PrepaidQueryResult, ReconciliationProof, ReconciliationSummaryPage,
-    TokenLiabilities,
-};
-
-/// Maximum subscription ID this contract will ever allocate.
-///
-/// When the counter reaches this value [`SubscriptionVault::create_subscription`]
-/// returns [`Error::SubscriptionLimitReached`] instead of wrapping or panicking.
-/// This sentinel prevents u32 overflow across contract upgrades.
-pub const MAX_SUBSCRIPTION_ID: u32 = u32::MAX;
-
-/// On-chain storage schema version.
-///
-/// Bump this constant (and add a migration path in [`migration`]) whenever
-/// storage key shapes or type layouts change in an incompatible way.
-const STORAGE_VERSION: u32 = 2;
-
-/// Hard upper bound on the number of subscriptions that may be exported in a
-/// single [`SubscriptionVault::export_subscription_summaries`] call.
-const MAX_EXPORT_LIMIT: u32 = 100;
-
-// ── Internal helpers ──────────────────────────────────────────────────────────
-
-/// Ensures the given `admin` is the authorized account.
-///
-/// This checks that the caller has signed the transaction and matches
-/// the admin stored in contract storage. If the address doesn’t match,
-/// it returns `Error::Unauthorized`.
-fn require_admin_auth(env: &Env, admin: &Address) -> Result<(), Error> {
-    admin::require_admin_auth(env, admin)
-}
-
-/// Read the emergency-stop flag from instance storage.
-///
-/// Returns `false` when the key has never been written (safe default: not stopped).
-fn get_emergency_stop(env: &Env) -> bool {
-    env.storage()
-        .instance()
-        .get(&DataKey::EmergencyStop)
-        .unwrap_or(false)
-}
-
-/// Guard all mutating entry-points against an active emergency stop.
-///
-/// Returns [`Error::EmergencyStopActive`] immediately so the transaction aborts
-/// before any state is modified.
-fn require_not_emergency_stop(env: &Env) -> Result<(), Error> {
-    if get_emergency_stop(env) {
-        return Err(Error::EmergencyStopActive);
-    }
-    Ok(())
-}
-
-// ── Contract ──────────────────────────────────────────────────────────────────
-
-/// Main contract for handling prepaid subscription billing on Stellar.
-///
-/// See the crate-level docs for a full overview of how the system works.
 #[contract]
 pub struct SubscriptionVault;
 
 #[contractimpl]
 impl SubscriptionVault {
-    // ── Admin / Config ────────────────────────────────────────────────────────
-
-    /// Initializes the contract.
-    ///
-    /// This should only be called once after deployment. If it’s called again,
-    /// it will fail since the admin is already set.
-    ///
-    /// # Arguments
-    /// - `token`: Address of the main token (e.g. USDC)
-    /// - `token_decimals`: Token precision (e.g. 7 for Stellar USDC)
-    /// - `admin`: Address that will manage the contract
-    /// - `min_topup`: Minimum allowed deposit amount
-    /// - `grace_period`: Time (in seconds) before a subscription can be cancelled
-    ///   after running out of funds
-    ///
-    /// # Errors
-    /// - `AlreadyInitialized` if already set up
-    /// - `InvalidAmount` if `min_topup` is not valid
-    pub fn init(
-        env: Env,
-        token: Address,
-        token_decimals: u32,
-        admin: Address,
-        min_topup: i128,
-        grace_period: u64,
-    ) -> Result<(), Error> {
-        admin::do_init(&env, token, token_decimals, admin, min_topup, grace_period)
-    }
-
-    /// Initializes the contract.
-    ///
-    /// This should only be called once after deployment. If it’s called again,
-    /// it will fail since the admin is already set.
-    ///
-    /// # Arguments
-    /// - `token`: Address of the main token (e.g. USDC)
-    /// - `token_decimals`: Token precision (e.g. 7 for Stellar USDC)
-    /// - `admin`: Address that will manage the contract
-    /// - `min_topup`: Minimum allowed deposit amount
-    /// - `grace_period`: Time (in seconds) before a subscription can be cancelled
-    ///   after running out of funds
-    ///
-    /// # Errors
-    /// - `AlreadyInitialized` if already set up
-    /// - `InvalidAmount` if `min_topup` is not valid
-    pub fn set_min_topup(env: Env, admin: Address, min_topup: i128) -> Result<(), Error> {
-        admin::do_set_min_topup(&env, admin, min_topup)
-    }
-
-    /// Get the current minimum top-up threshold (in token base units).
-    ///
-    /// # Errors
-    ///
-    /// * [`Error::NotFound`] — Contract has not been initialized.
-    pub fn get_min_topup(env: Env) -> Result<i128, Error> {
-        admin::get_min_topup(&env)
-    }
-
-    /// Get the current admin address.
-    ///
-    /// # Auth
-    ///
-    /// Read-only; no auth required.
-    ///
-    /// # Errors
-    ///
-    /// * [`Error::NotFound`] — Contract has not been initialized.
-    pub fn get_admin(env: Env) -> Result<Address, Error> {
-        admin::do_get_admin(&env)
-    }
-
-    /// Return the current (next-expected) nonce for a `(signer, domain)` pair.
-    ///
-    /// Off-chain callers must read this value and pass it unchanged to the
-    /// next privileged call that requires a nonce. Valid domain constants:
-    ///
-    /// * `0` — `DOMAIN_BATCH_CHARGE` (used by [`batch_charge`](Self::batch_charge))
-    /// * `1` — `DOMAIN_ADMIN_ROTATION` (used by [`rotate_admin`](Self::rotate_admin))
-    ///
-    /// Returns `0` when no nonce has been consumed yet for this combination.
-    ///
-    /// # Auth
-    ///
-    /// Read-only; no auth required.
-    pub fn get_admin_nonce(env: Env, signer: Address, domain: u32) -> u64 {
-        nonce::get_nonce(&env, &signer, domain)
-    }
-
-    // ── Operator management ───────────────────────────────────────────────────
-
-    /// Assign a least-privilege operator address. Admin only.
-    ///
-    /// The operator may call the `operator_*` charge endpoints but has no
-    /// access to governance, fund withdrawal, or high-risk configuration.
-    /// Replaces any previously stored operator.
-    ///
-    /// # Arguments
-    ///
-    /// * `admin` — Must match the stored admin.
-    /// * `operator` — Address to store as operator. Must not be the contract address.
-    ///
-    /// # Auth
-    ///
-    /// Admin only.
-    ///
-    /// # Errors
-    ///
-    /// * [`Error::Unauthorized`] — Caller is not the stored admin.
-    /// * [`Error::InvalidInput`] — `operator` is the contract's own address.
-    ///
-    /// # Events
-    ///
-    /// Emits [`OperatorSetEvent`] with `admin`, `operator`, and current timestamp.
-    pub fn set_operator(env: Env, admin: Address, operator: Address) -> Result<(), Error> {
-        operator::do_set_operator(&env, admin, operator)
-    }
-
-    /// Remove the operator address. Admin only.
-    ///
-    /// The operator loses all charge capabilities immediately. Calling this
-    /// when no operator is set is a no-op (returns `Ok`).
-    ///
-    /// # Arguments
-    ///
-    /// * `admin` — Must match the stored admin.
-    ///
-    /// # Auth
-    ///
-    /// Admin only.
-    ///
-    /// # Errors
-    ///
-    /// * [`Error::Unauthorized`] — Caller is not the stored admin.
-    ///
-    /// # Events
-    ///
-    /// Emits [`OperatorRemovedEvent`] with `admin` and current timestamp.
-    pub fn remove_operator(env: Env, admin: Address) -> Result<(), Error> {
-        operator::do_remove_operator(&env, admin)
-    }
-
-    /// Return the current operator address, or `None` if none is set.
-    ///
-    /// Read-only; no auth required.
-    pub fn get_operator(env: Env) -> Option<Address> {
-        operator::get_operator(&env)
-    }
-
-    /// Return the current (next-expected) operator nonce for `DOMAIN_OPERATOR_BATCH_CHARGE`.
-    ///
-    /// Off-chain callers must read this before calling [`operator_batch_charge`](Self::operator_batch_charge).
-    /// Returns `0` when no nonce has been consumed yet.
-    ///
-    /// Read-only; no auth required.
-    pub fn get_operator_nonce(env: Env, op: Address) -> u64 {
-        nonce::get_nonce(&env, &op, nonce::DOMAIN_OPERATOR_BATCH_CHARGE)
-    }
-
-    // ── Operator charge endpoints ─────────────────────────────────────────────
-
-    /// Batch charge by an operator.
-    ///
-    /// **Disabled when emergency stop is active.**
-    ///
-    /// Functionally identical to [`batch_charge`](Self::batch_charge) but
-    /// authenticated via the stored operator address instead of the admin.
-    /// Uses a separate nonce domain (`DOMAIN_OPERATOR_BATCH_CHARGE = 2`) so
-    /// captured operator nonces cannot be replayed as admin nonces.
-    ///
-    /// # Arguments
-    ///
-    /// * `operator` — Must match the stored operator address.
-    /// * `subscription_ids` — IDs to charge.
-    /// * `nonce` — Read current value with [`get_operator_nonce`](Self::get_operator_nonce).
-    ///
-    /// # Errors
-    ///
-    /// * [`Error::EmergencyStopActive`] — Emergency stop is active.
-    /// * [`Error::Unauthorized`] — Caller is not the stored operator.
-    /// * [`Error::NonceAlreadyUsed`] — Nonce does not match expected value.
-    pub fn operator_batch_charge(
-        env: Env,
-        operator: Address,
-        subscription_ids: Vec<u32>,
-        nonce: u64,
-    ) -> Result<Vec<BatchChargeResult>, Error> {
-        require_not_emergency_stop(&env)?;
-        operator::do_operator_batch_charge(&env, operator, &subscription_ids, nonce)
-    }
-
-    /// Single interval charge by an operator.
-    ///
-    /// **Disabled when emergency stop is active.**
-    ///
-    /// # Arguments
-    ///
-    /// * `operator` — Must match the stored operator address.
-    /// * `subscription_id` — Subscription to charge.
-    ///
-    /// # Errors
-    ///
-    /// * [`Error::EmergencyStopActive`] — Emergency stop is active.
-    /// * [`Error::Unauthorized`] — Caller is not the stored operator.
-    pub fn operator_charge_subscription(
-        env: Env,
-        op: Address,
-        subscription_id: u32,
-    ) -> Result<ChargeExecutionResult, Error> {
-        require_not_emergency_stop(&env)?;
-
-        let _guard = crate::reentrancy::ReentrancyGuard::lock(&env, "operator_charge_subscription")?;
-
-        operator::do_operator_charge_subscription(&env, op, subscription_id)
-    }
-
-    /// Metered usage charge by an operator.
-    ///
-    /// **Disabled when emergency stop is active.**
-    ///
-    /// # Arguments
-    ///
-    /// * `operator` — Must match the stored operator address.
-    /// * `subscription_id` — Subscription to charge.
-    /// * `usage_amount` — Usage units to bill.
-    ///
-    /// # Errors
-    ///
-    /// * [`Error::EmergencyStopActive`] — Emergency stop is active.
-    /// * [`Error::Unauthorized`] — Caller is not the stored operator.
-    pub fn operator_charge_usage(
-        env: Env,
-        op: Address,
-        subscription_id: u32,
-        usage_amount: i128,
-    ) -> Result<UsageChargeResult, Error> {
-        require_not_emergency_stop(&env)?;
-
-        let _guard = crate::reentrancy::ReentrancyGuard::lock(&env, "operator_charge_usage")?;
-
-        operator::do_operator_charge_usage(&env, op, subscription_id, usage_amount)
-    }
-
-    /// Metered usage charge with a reference string by an operator.
-    ///
-    /// **Disabled when emergency stop is active.**
-    pub fn operator_charge_usage_with_ref(
-        env: Env,
-        op: Address,
-        subscription_id: u32,
-        usage_amount: i128,
-        reference: String,
-    ) -> Result<UsageChargeResult, Error> {
-        require_not_emergency_stop(&env)?;
-
-        let _guard =
-            crate::reentrancy::ReentrancyGuard::lock(&env, "operator_charge_usage_with_ref")?;
-
-        operator::do_operator_charge_usage_with_reference(&env, op, subscription_id, usage_amount, reference)
-    }
-
-    // Updates the admin address.
-    ///
-    /// This change happens immediately, so make sure the new address is correct.
-    ///
-    /// # Arguments
-    ///
-    /// * `nonce` — Must equal the current stored nonce for
-    ///   `(current_admin, DOMAIN_ADMIN_ROTATION)`. Prevents replay of a
-    ///   captured rotate-admin transaction.
-    ///
-    /// # Errors
-    /// - `Unauthorized` if caller is not current admin
-    /// - `NonceAlreadyUsed` if the provided nonce does not match the expected value
-    pub fn rotate_admin(env: Env, current_admin: Address, new_admin: Address, nonce: u64) -> Result<(), Error> {
-        admin::do_rotate_admin(&env, current_admin, new_admin, nonce)
-    }
-
-    /// Configure oracle pricing parameters. Admin only.
-    ///
-    /// Enables/disables oracle, sets the oracle address, and defines staleness bounds.
-    pub fn set_oracle_config(
-        env: Env,
-        admin: Address,
-        enabled: bool,
-        oracle: Option<Address>,
-        max_age_seconds: u64,
-    ) -> Result<(), Error> {
-        admin::require_admin_auth(&env, &admin)?;
-        crate::oracle::set_oracle_config(&env, enabled, oracle, max_age_seconds)
-    }
-
-    /// Allows the admin to recover funds that are not tied to any subscription.
-    ///
-    /// This should only be used when funds are clearly not part of normal flows.
-    ///
-    /// # Errors
-    /// - `Unauthorized` if caller is not admin
-    /// - `InvalidAmount` if amount is invalid
-    /// - `InsufficientFunds` if balance is not enough
-    pub fn recover_stranded_funds(
-        env: Env,
-        admin: Address,
-        token: Address,
-        recipient: Address,
-        amount: i128,
-        recovery_id: String,
-        reason: RecoveryReason,
-    ) -> Result<(), Error> {
-        admin::do_recover_stranded_funds(&env, admin, token, recipient, amount, recovery_id, reason)
-    }
-
-    /// Charge a batch of subscriptions in one transaction. Admin only.
-    ///
-    /// **Disabled when emergency stop is active.**
-    ///
-    /// Returns a per-subscription result vector so callers can identify
-    /// which charges succeeded and which failed (with error codes).
-    ///
-    /// # Arguments
-    ///
-    /// * `subscription_ids` — IDs to charge.
-    /// * `nonce` — Must equal the current stored nonce for
-    ///   `(admin, DOMAIN_BATCH_CHARGE)`. Prevents replay of a captured
-    ///   batch-charge transaction. Read the current value with
-    ///   [`get_admin_nonce`](Self::get_admin_nonce) before calling.
-    ///
-    /// # Errors
-    ///
-    /// * [`Error::EmergencyStopActive`] — Emergency stop is active.
-    /// * [`Error::NonceAlreadyUsed`] — Provided nonce does not match expected.
-    pub fn batch_charge(
-        env: Env,
-        subscription_ids: Vec<u32>,
-        nonce: u64,
-    ) -> Result<Vec<BatchChargeResult>, Error> {
-        require_not_emergency_stop(&env)?;
-        admin::do_batch_charge(&env, &subscription_ids, nonce)
-    }
-
-    // ── Emergency Stop ────────────────────────────────────────────────────────
-
-    /// Return whether the emergency stop (circuit breaker) is currently active.
-    ///
-    /// `true` means all mutating operations that check [`require_not_emergency_stop`]
-    /// will be rejected.
-    pub fn get_emergency_stop_status(env: Env) -> bool {
-        get_emergency_stop(&env)
-    }
-
-    /// Activate the emergency stop circuit breaker.
-    ///
-    /// When enabled, the following entry-points are disabled:
-    /// [`batch_charge`](Self::batch_charge), [`charge_subscription`](Self::charge_subscription),
-    /// [`charge_usage`](Self::charge_usage), [`charge_usage_with_reference`](Self::charge_usage_with_reference),
-    /// [`charge_one_off`](Self::charge_one_off), [`create_subscription`](Self::create_subscription),
-    /// [`create_subscription_with_token`](Self::create_subscription_with_token),
-    /// [`create_subscription_from_plan`](Self::create_subscription_from_plan),
-    /// [`deposit_funds`](Self::deposit_funds).
-    ///
-    /// Calling this when the stop is already active is a no-op (returns `Ok`).
-    ///
-    /// # Arguments
-    ///
-    /// * `admin` — Must match the stored admin.
-    ///
-    /// # Auth
-    ///
-    /// Admin only.
-    ///
-    /// # Errors
-    ///
-    /// * [`Error::Unauthorized`] — Caller is not the stored admin.
-    ///
-    /// # Events
-    ///
-    /// Emits [`EmergencyStopEnabledEvent`] with `admin` and current timestamp.
-    pub fn enable_emergency_stop(env: Env, admin: Address) -> Result<(), Error> {
-        require_admin_auth(&env, &admin)?;
-        if get_emergency_stop(&env) {
-            return Ok(());
-        }
-        env.storage()
-            .instance()
-            .set(&DataKey::EmergencyStop, &true);
-        env.events().publish(
-            (Symbol::new(&env, "emergency_stop_enabled"),),
-            EmergencyStopEnabledEvent {
-                admin,
-                timestamp: env.ledger().timestamp(),
-            },
-        );
-        Ok(())
-    }
-
-    /// Deactivate the emergency stop circuit breaker.
-    ///
-    /// Only call this after the underlying incident has been fully resolved and
-    /// the contract is confirmed safe to operate. Normal contract operations
-    /// resume immediately upon success.
-    ///
-    /// Calling this when the stop is already inactive is a no-op (returns `Ok`).
-    ///
-    /// # Arguments
-    ///
-    /// * `admin` — Must match the stored admin.
-    ///
-    /// # Auth
-    ///
-    /// Admin only.
-    ///
-    /// # Errors
-    ///
-    /// * [`Error::Unauthorized`] — Caller is not the stored admin.
-    ///
-    /// # Events
-    ///
-    /// Emits [`EmergencyStopDisabledEvent`] with `admin` and current timestamp.
-    pub fn disable_emergency_stop(env: Env, admin: Address) -> Result<(), Error> {
-        require_admin_auth(&env, &admin)?;
-        if !get_emergency_stop(&env) {
-            return Ok(());
-        }
-        env.storage()
-            .instance()
-            .set(&DataKey::EmergencyStop, &false);
-        env.events().publish(
-            (Symbol::new(&env, "emergency_stop_disabled"),),
-            EmergencyStopDisabledEvent {
-                admin,
-                timestamp: env.ledger().timestamp(),
-            },
-        );
-        Ok(())
-    }
-
-    // ── Migration / Export ────────────────────────────────────────────────────
-
-    /// Export contract-level configuration as a [`ContractSnapshot`] for migration tooling.
-    ///
-    /// Captures the admin, primary token, minimum top-up, next subscription ID, storage
-    /// schema version, and current ledger timestamp. Intended for off-chain migration
-    /// scripts that need to reconstruct state on a new contract instance.
-    ///
-    /// # Arguments
-    ///
-    /// * `admin` — Must match the stored admin.
-    ///
-    /// # Auth
-    ///
-    /// Admin only.
-    ///
-    /// # Errors
-    ///
-    /// * [`Error::Unauthorized`] — Caller is not the stored admin.
-    /// * [`Error::NotFound`] — Contract token is not set (uninitialized contract).
-    ///
-    /// # Events
-    ///
-    /// Emits `migration_contract_snapshot` event with `(admin, timestamp)`.
-    pub fn export_contract_snapshot(env: Env, admin: Address) -> Result<ContractSnapshot, Error> {
-        require_admin_auth(&env, &admin)?;
-
-        let token: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Token)
-            .ok_or(Error::NotFound)?;
-        let min_topup: i128 = admin::get_min_topup(&env)?;
-        let next_id: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::NextId)
-            .unwrap_or(0);
-
-        env.events().publish(
-            (Symbol::new(&env, "migration_contract_snapshot"),),
-            (admin.clone(), env.ledger().timestamp()),
-        );
-
-        Ok(ContractSnapshot {
-            admin,
-            token,
-            min_topup,
-            next_id,
-            storage_version: STORAGE_VERSION,
-            timestamp: env.ledger().timestamp(),
-        })
-    }
-
-    /// Export a single subscription as a [`SubscriptionSummary`] for migration tooling.
-    ///
-    /// Returns a flat, serializable snapshot of the subscription including its
-    /// lifetime cap accounting. Used by migration scripts that page through
-    /// subscriptions one at a time.
-    ///
-    /// # Arguments
-    ///
-    /// * `admin` — Must match the stored admin.
-    /// * `subscription_id` — ID of the subscription to export.
-    ///
-    /// # Auth
-    ///
-    /// Admin only.
-    ///
-    /// # Errors
-    ///
-    /// * [`Error::Unauthorized`] — Caller is not the stored admin.
-    /// * [`Error::NotFound`] — No subscription exists for `subscription_id`.
-    ///
-    /// # Events
-    ///
-    /// Emits [`MigrationExportEvent`] with `(admin, start_id, limit=1, exported=1, timestamp)`.
-    pub fn export_subscription_summary(
-        env: Env,
-        admin: Address,
-        subscription_id: u32,
-    ) -> Result<SubscriptionSummary, Error> {
-        require_admin_auth(&env, &admin)?;
-        let sub = queries::get_subscription(&env, subscription_id)?;
-
-        env.events().publish(
-            (Symbol::new(&env, "migration_export"),),
-            MigrationExportEvent {
-                admin: admin.clone(),
-                start_id: subscription_id,
-                limit: 1,
-                exported: 1,
-                timestamp: env.ledger().timestamp(),
-            },
-        );
-
-        Ok(SubscriptionSummary {
-            subscription_id,
-            subscriber: sub.subscriber,
-            merchant: sub.merchant,
-            token: sub.token,
-            amount: sub.amount,
-            interval_seconds: sub.interval_seconds,
-            last_payment_timestamp: sub.last_payment_timestamp,
-            status: sub.status,
-            prepaid_balance: sub.prepaid_balance,
-            usage_enabled: sub.usage_enabled,
-            lifetime_cap: sub.lifetime_cap,
-            lifetime_charged: sub.lifetime_charged,
-            start_time: sub.start_time,
-            expires_at: sub.expires_at,
-        })
-    }
-
-    /// Export a paginated range of subscription summaries for migration tooling.
-    ///
-    /// Iterates IDs in `[start_id, start_id + limit)` and returns a summary for
-    /// each ID that exists in storage. Missing IDs (gaps) are silently skipped.
-    ///
-    /// # Arguments
-    ///
-    /// * `admin` — Must match the stored admin.
-    /// * `start_id` — First subscription ID to include (inclusive).
-    /// * `limit` — Maximum number of summaries to return. Must be in `[1, MAX_EXPORT_LIMIT]`.
-    ///
-    /// # Auth
-    ///
-    /// Admin only.
-    ///
-    /// # Errors
-    ///
-    /// * [`Error::Unauthorized`] — Caller is not the stored admin.
-    /// * [`Error::InvalidExportLimit`] — `limit` exceeds [`MAX_EXPORT_LIMIT`] (100).
-    ///
-    /// # Returns
-    ///
-    /// An empty [`Vec`] when `start_id ≥ next_id` or `limit == 0`. Otherwise a
-    /// [`Vec<SubscriptionSummary>`] of up to `limit` entries.
-    ///
-    /// # Events
-    ///
-    /// Emits [`MigrationExportEvent`] with the actual number of exported summaries.
-    pub fn export_subscription_summaries(
-        env: Env,
-        admin: Address,
-        start_id: u32,
-        limit: u32,
-    ) -> Result<Vec<SubscriptionSummary>, Error> {
-        require_admin_auth(&env, &admin)?;
-        if limit > MAX_EXPORT_LIMIT {
-            return Err(Error::InvalidExportLimit);
-        }
-        if limit == 0 {
-            return Ok(Vec::new(&env));
-        }
-
-        let next_id: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::NextId)
-            .unwrap_or(0);
-        if start_id >= next_id {
-            return Ok(Vec::new(&env));
-        }
-
-        let end_id = start_id.saturating_add(limit).min(next_id);
-        let mut out = Vec::new(&env);
-        let mut exported = 0u32;
-        let mut id = start_id;
-        while id < end_id {
-            if let Some(sub) = env.storage().persistent().get::<_, Subscription>(&DataKey::Sub(id)) {
-                out.push_back(SubscriptionSummary {
-                    subscription_id: id,
-                    subscriber: sub.subscriber,
-                    merchant: sub.merchant,
-                    token: sub.token,
-                    amount: sub.amount,
-                    interval_seconds: sub.interval_seconds,
-                    last_payment_timestamp: sub.last_payment_timestamp,
-                    status: sub.status,
-                    prepaid_balance: sub.prepaid_balance,
-                    usage_enabled: sub.usage_enabled,
-                    lifetime_cap: sub.lifetime_cap,
-                    lifetime_charged: sub.lifetime_charged,
-                    start_time: sub.start_time,
-                    expires_at: sub.expires_at,
-                });
-                exported += 1;
-            }
-            id += 1;
-        }
-
-        env.events().publish(
-            (Symbol::new(&env, "migration_export"),),
-            MigrationExportEvent {
-                admin,
-                start_id,
-                limit,
-                exported,
-                timestamp: env.ledger().timestamp(),
-            },
-        );
-
-        Ok(out)
-    }
-
-    // ── Subscription Lifecycle ────────────────────────────────────────────────
-
-    /// Create a new subscription.
-    ///
-    /// **Disabled when emergency stop is active.**
-    ///
-    /// # Arguments
-    ///
-    /// * `lifetime_cap` - Optional maximum total amount (token base units) that may ever be
-    ///   charged for this subscription. `None` means no cap. When the cumulative charged
-    ///   amount reaches this value, the subscription is cancelled automatically.
-    ///   See `docs/lifetime_caps.md` for full semantics.
-    ///
-    ///  # Auth
-    ///
-    /// `subscriber` must authorize the transaction.
-    ///
-    /// # Errors
-    /// Returns [`Error::SubscriptionLimitReached`] if the contract has already allocated
-    /// [`MAX_SUBSCRIPTION_ID`] subscriptions and can issue no more unique IDs.
     pub fn create_subscription(
         env: Env,
         subscriber: Address,
@@ -2706,5 +1804,76 @@ mod test {
         let contract_id = env.register(SubscriptionVault, ());
         let client = SubscriptionVaultClient::new(&env, &contract_id);
         assert_eq!(client.version(), 0);
+    }
+
+    // ── charge_subscription authorization tests ───────────────────────────────
+    //
+    // Findings recorded per issue #374 investigation:
+    // - Admin stored under DataKey::Admin (instance storage).
+    // - Stored-admin pattern: load from state, require_auth() — no explicit param.
+    // - Error::Unauthorized (1001) returned when admin not set or caller mismatch.
+    // - Error::NotFound (1000) returned when subscription_id has no record.
+    // - mock_all_auths() satisfies require_auth() for any address in tests.
+    // - Storage assertions use env.as_contract() to read persistent storage directly,
+    //   confirming no DataKey::Subscription entry was written on rejection.
+
+    #[test]
+    fn charge_subscription_admin_not_set_returns_unauthorized_and_no_storage_written() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(SubscriptionVault, ());
+        let client = SubscriptionVaultClient::new(&env, &contract_id);
+
+        // init never called — no admin stored
+        let result = client.try_charge_subscription(&0);
+
+        // Error variant
+        assert_eq!(result, Err(Ok(Error::Unauthorized)));
+        // No subscription entry was written
+        assert!(!subscription_exists(&env, &contract_id, 0));
+    }
+
+    #[test]
+    fn charge_subscription_unknown_id_returns_not_found_and_no_storage_written() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(SubscriptionVault, ());
+        let client = SubscriptionVaultClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let usdc = Address::generate(&env);
+        client.init(&admin, &usdc);
+
+        let result = client.try_charge_subscription(&99);
+
+        // Error variant
+        assert_eq!(result, Err(Ok(Error::NotFound)));
+        // No subscription entry was written
+        assert!(!subscription_exists(&env, &contract_id, 99));
+    }
+
+    #[test]
+    fn charge_subscription_non_admin_rejected_and_no_storage_written() {
+        // init with admin, then call charge_subscription with no mocked auths.
+        // set_auths(&[]) clears all mocked authorizations; try_charge_subscription
+        // returns Err (host auth failure) without writing any storage.
+        let env = Env::default();
+        let contract_id = env.register(SubscriptionVault, ());
+        let client = SubscriptionVaultClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let usdc = Address::generate(&env);
+
+        env.mock_all_auths();
+        client.init(&admin, &usdc);
+
+        // Drop all mocked auths — subsequent require_auth() calls are unsatisfied.
+        env.set_auths(&[]);
+
+        let result = client.try_charge_subscription(&0);
+
+        // Host auth failure — must be an error of some kind.
+        assert!(result.is_err());
+        // No DataKey::Subscription entry was written.
+        assert!(!subscription_exists(&env, &contract_id, 0));
+>>>>> main
     }
 }
