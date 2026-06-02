@@ -13,6 +13,7 @@
 use soroban_sdk::{contract, contractimpl, Address, Env, String, Symbol, Vec};
 
 mod admin;
+pub mod blocklist;
 mod charge_core;
 mod merchant;
 mod metadata;
@@ -24,57 +25,6 @@ mod types;
 pub use safe_math::*;
 
 // ── Stub modules for features not yet extracted to separate files ─────────────
-
-/// Blocklist: prevents blacklisted subscribers from creating or receiving charges.
-pub mod blocklist {
-    #![allow(unused_variables, dead_code)]
-    use crate::types::Error;
-    use soroban_sdk::{contracttype, Address, Env, String};
-
-    #[contracttype]
-    #[derive(Clone)]
-    pub struct BlocklistEntry {
-        pub reason: String,
-    }
-
-    #[contracttype]
-    #[derive(Clone)]
-    pub struct BlocklistAddedEvent {
-        pub subscriber: Address,
-        pub reason: String,
-    }
-
-    #[contracttype]
-    #[derive(Clone)]
-    pub struct BlocklistRemovedEvent {
-        pub subscriber: Address,
-    }
-
-    pub fn is_blocklisted(_env: &Env, _addr: &Address) -> bool {
-        false
-    }
-    pub fn require_not_blocklisted(_env: &Env, _addr: &Address) -> Result<(), Error> {
-        Ok(())
-    }
-    pub fn get_blocklist_entry(_env: &Env, _addr: Address) -> Result<BlocklistEntry, Error> {
-        Err(Error::NotFound)
-    }
-    pub fn do_add_to_blocklist(
-        _env: &Env,
-        _authorizer: Address,
-        _subscriber: Address,
-        _reason: Option<String>,
-    ) -> Result<(), Error> {
-        Ok(())
-    }
-    pub fn do_remove_from_blocklist(
-        _env: &Env,
-        _admin: Address,
-        _subscriber: Address,
-    ) -> Result<(), Error> {
-        Ok(())
-    }
-}
 
 /// State machine: validates and applies subscription status transitions.
 pub mod state_machine;
