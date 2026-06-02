@@ -296,19 +296,7 @@ pub mod oracle {
     }
 }
 
-/// Reentrancy guard: single-entry lock per named critical section.
-pub mod reentrancy {
-    #![allow(unused_variables, dead_code)]
-    use crate::types::Error;
-    use soroban_sdk::Env;
-
-    pub struct ReentrancyGuard;
-    impl ReentrancyGuard {
-        pub fn lock(_env: &Env, _name: &str) -> Result<Self, Error> {
-            Ok(Self)
-        }
-    }
-}
+mod reentrancy;
 
 /// Nonce: replay-protection counters for privileged operations.
 ///
