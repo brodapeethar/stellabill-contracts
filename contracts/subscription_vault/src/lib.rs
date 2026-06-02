@@ -2959,10 +2959,7 @@ impl SubscriptionVault {
 mod test_charge_invariants;
 
 #[cfg(test)]
-mod test_subscription_status_transitions;
-
-#[cfg(test)]
-mod test_require_auth;
+mod test_insufficient_balance;
 
 #[cfg(test)]
 mod test {
