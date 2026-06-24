@@ -37,8 +37,12 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install pytest
-        run: pip install pytest
+      - name: Install pytest and coverage
+        run: pip install pytest pytest-cov
 
-      - name: Run script tests
-        run: pytest scripts/test_generate_error_table.py -v --tb=short
+      - name: Run script tests with coverage
+        run: |
+          pytest scripts/test_generate_error_table.py -v --tb=short \
+            --cov=scripts/generate_error_table \
+            --cov-report=term-missing \
+            --cov-fail-under=95
