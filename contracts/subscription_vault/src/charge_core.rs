@@ -36,24 +36,11 @@ use crate::state_machine::transition_to;
 use crate::subscription::{next_charge_time, write_subscription};
 use crate::statements::append_statement;
 use crate::types::{
-    BillingChargeKind,
-    BillingPeriodSnapshot,
-    ChargeExecutionResult,
-    DataKey,
-    Error,
-    GracePeriodEnteredEvent,
-    LifetimeCapReachedEvent,
-    SubscriptionChargeFailedEvent,
-    SubscriptionChargedEvent,
-    SubscriptionStatus,
-    UsageChargeRejectedEvent,
-    UsageChargeResult,
-    UsageLimits,
-    UsageState,
-    UsageStatementEvent,
-    SNAPSHOT_FLAG_CLOSED,
-    SNAPSHOT_FLAG_INTERVAL_CHARGED,
-    SNAPSHOT_FLAG_USAGE_CHARGED,
+    BillingChargeKind, BillingPeriodSnapshot, ChargeExecutionResult, DataKey, Error,
+    SubscriptionCancelledEvent,
+    GracePeriodEnteredEvent, LifetimeCapReachedEvent, SubscriptionChargeFailedEvent, SubscriptionChargedEvent,
+    SubscriptionStatus, UsageChargeRejectedEvent, UsageChargeResult, UsageLimits, UsageState,
+    UsageStatementEvent, SNAPSHOT_FLAG_CLOSED, SNAPSHOT_FLAG_INTERVAL_CHARGED, SNAPSHOT_FLAG_USAGE_CHARGED,
 };
 use soroban_sdk::{symbol_short, Env, String, Symbol};
 
@@ -110,6 +97,42 @@ pub fn charge_one(
                 );
             }
             return Ok(ChargeExecutionResult::LifetimeCapReached);
+        }
+    }
+
+    // Scheduled cancellation: fire when cancel_at has arrived.
+    if let Some(cancel_at) = sub.cancel_at {
+        if now >= cancel_at {
+            if sub.status != SubscriptionStatus::Cancelled {
+                transition_to(&mut sub.status, SubscriptionStatus::Cancelled)?;
+                let refund_amount = sub.prepaid_balance;
+                sub.prepaid_balance = 0;
+                sub.cancel_at = None;
+                let token_addr = sub.token.clone();
+                write_subscription(env, subscription_id, &sub);
+                if refund_amount > 0 {
+                    let token_client = soroban_sdk::token::Client::new(env, &token_addr);
+                    token_client.transfer(
+                        &env.current_contract_address(),
+                        &sub.subscriber,
+                        &refund_amount,
+                    );
+                    crate::accounting::sub_total_accounted(env, &token_addr, refund_amount)?;
+                }
+                env.events().publish(
+                    (soroban_sdk::Symbol::new(env, "subscription_cancelled"), subscription_id),
+                    SubscriptionCancelledEvent {
+                        subscription_id,
+                        subscriber: sub.subscriber.clone(),
+                        merchant: sub.merchant.clone(),
+                        token: sub.token.clone(),
+                        authorizer: sub.subscriber.clone(),
+                        refund_amount,
+                        timestamp: now,
+                    },
+                );
+            }
+            return Ok(ChargeExecutionResult::ScheduledCancellation);
         }
     }
 
