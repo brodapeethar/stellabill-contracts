@@ -462,6 +462,7 @@ pub fn do_deposit_funds(
     subscription_id: u32,
     subscriber: Address,
     amount: i128,
+    idem_key: Option<soroban_sdk::BytesN<32>>,
 ) -> Result<(), Error> {
     subscriber.require_auth();
     crate::blocklist::require_not_blocklisted(env, &subscriber)?;
@@ -506,6 +507,18 @@ pub fn do_deposit_funds(
         return Err(Error::SubscriptionExpired);
     }
 
+    // Idempotent return: same idempotency key already processed
+    if let Some(ref k) = idem_key {
+        let hashed = crate::idempotency::hash_idem_key(
+            env,
+            crate::types::DOMAIN_DEPOSIT_FUNDS,
+            subscription_id,
+            k,
+        );
+        if crate::idempotency::check_key(env, subscription_id, &hashed) {
+            return Ok(());
+        }
+    }
 
     let token_addr = sub.token.clone();
 
@@ -570,6 +583,17 @@ pub fn do_deposit_funds(
                 schema_version: crate::types::EVENT_SCHEMA_VERSION,
             },
         );
+    }
+
+    // Record idempotency key after successful deposit
+    if let Some(k) = idem_key {
+        let hashed = crate::idempotency::hash_idem_key(
+            env,
+            crate::types::DOMAIN_DEPOSIT_FUNDS,
+            subscription_id,
+            &k,
+        );
+        crate::idempotency::push_key(env, subscription_id, &hashed);
     }
 
     Ok(())
@@ -783,6 +807,7 @@ pub fn do_charge_one_off(
     subscription_id: u32,
     merchant: Address,
     amount: i128,
+    idem_key: Option<soroban_sdk::BytesN<32>>,
 ) -> Result<(), Error> {
     merchant.require_auth();
 
@@ -807,6 +832,19 @@ pub fn do_charge_one_off(
             );
         }
         return Err(Error::SubscriptionExpired);
+    }
+
+    // Idempotent return: same idempotency key already processed
+    if let Some(ref k) = idem_key {
+        let hashed = crate::idempotency::hash_idem_key(
+            env,
+            crate::types::DOMAIN_CHARGE_ONEOFF,
+            subscription_id,
+            k,
+        );
+        if crate::idempotency::check_key(env, subscription_id, &hashed) {
+            return Ok(());
+        }
     }
 
     if sub.merchant != merchant {
@@ -952,6 +990,17 @@ pub fn do_charge_one_off(
             schema_version: crate::types::EVENT_SCHEMA_VERSION,
         },
     );
+
+    // Record idempotency key after successful one-off charge
+    if let Some(k) = idem_key {
+        let hashed = crate::idempotency::hash_idem_key(
+            env,
+            crate::types::DOMAIN_CHARGE_ONEOFF,
+            subscription_id,
+            &k,
+        );
+        crate::idempotency::push_key(env, subscription_id, &hashed);
+    }
 
     Ok(())
 }
