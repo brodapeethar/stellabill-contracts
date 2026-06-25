@@ -113,6 +113,10 @@ pub mod statements {
     }
 }
 
+// Period snapshots live in `period_snapshots.rs` (declared above as
+// `pub mod period_snapshots;`). The earlier inline stub module was a stale
+// merge artifact that duplicated that real module and is removed here.
+
 /// Accounting: tracks total tokens accounted for across all subscriptions.
 ///
 /// # Invariant
