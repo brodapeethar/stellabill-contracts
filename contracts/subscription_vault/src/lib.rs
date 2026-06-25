@@ -22,7 +22,6 @@ mod queries;
 mod safe_math;
 mod subscription;
 mod types;
-pub mod period_snapshots;
 
 pub use safe_math::*;
 
@@ -114,9 +113,9 @@ pub mod statements {
     }
 }
 
-// ── Period snapshots (stub — separated into own file) ───────────────────────
-// The actual implementation lives in `period_snapshots.rs`.  The module is
-// declared at the top of this file.
+// Period snapshots live in `period_snapshots.rs` (declared above as
+// `pub mod period_snapshots;`). The earlier inline stub module was a stale
+// merge artifact that duplicated that real module and is removed here.
 
 /// Accounting: tracks total tokens accounted for across all subscriptions.
 ///
@@ -317,12 +316,14 @@ pub use types::{
     MAX_METADATA_KEYS, MAX_METADATA_KEY_LENGTH, MAX_METADATA_VALUE_LENGTH,
     SNAPSHOT_FLAG_CLOSED, SNAPSHOT_FLAG_EMPTY, SNAPSHOT_FLAG_INTERVAL_CHARGED,
     SNAPSHOT_FLAG_USAGE_CHARGED,
+    SUB_TTL_EXTEND_TO, SUB_TTL_THRESHOLD,
     OP_CHARGE, OP_WITHDRAW, OP_REFUND, OP_BILLING_PAUSE, OP_AUTO_RENEWAL,
     DEFAULT_ALLOWED_OPS,
     GlobalCapDefaultUpdatedEvent, LifetimeCapUpdatedEvent, MerchantCapDefaultUpdatedEvent,
     OperatorRemovedEvent, OperatorSetEvent,
     PrepaidQueryRequest, PrepaidQueryResult, ReconciliationProof, ReconciliationSummaryPage,
     TokenLiabilities,
+    FullSnapshotPage, MerchantBalanceEntry, SnapshotExportedEvent, SnapshotRestoredEvent,
 };
 
 /// Maximum subscription ID this contract will ever allocate.
@@ -1065,6 +1066,183 @@ impl SubscriptionVault {
         Ok(out)
     }
 
+    /// Export a paginated full snapshot page including subscriptions and merchant balances.
+    ///
+    /// Admin only. `size` limited to `MAX_EXPORT_LIMIT` to bound compute.
+    pub fn export_full_snapshot_page(
+        env: Env,
+        admin: Address,
+        start_id: u32,
+        size: u32,
+    ) -> Result<FullSnapshotPage, Error> {
+        require_admin_auth(&env, &admin)?;
+        if size == 0 {
+            return Ok(FullSnapshotPage {
+                subscriptions: Vec::new(&env),
+                balances: Vec::new(&env),
+                next_start_id: None,
+            });
+        }
+        let size = size.min(MAX_EXPORT_LIMIT);
+        let next_id: u32 = env.storage().instance().get(&DataKey::NextId).unwrap_or(0);
+        if start_id >= next_id {
+            return Ok(FullSnapshotPage {
+                subscriptions: Vec::new(&env),
+                balances: Vec::new(&env),
+                next_start_id: None,
+            });
+        }
+
+        let end_id = start_id.saturating_add(size).min(next_id);
+        let mut subs = Vec::new(&env);
+        let mut balances = Vec::new(&env);
+        let mut exported: u32 = 0;
+
+        let mut id = start_id;
+        while id < end_id {
+            if let Some(sub) = env
+                .storage()
+                .persistent()
+                .get::<_, Subscription>(&DataKey::Sub(id))
+            {
+                subs.push_back(SubscriptionSummary {
+                    subscription_id: id,
+                    subscriber: sub.subscriber.clone(),
+                    merchant: sub.merchant.clone(),
+                    token: sub.token.clone(),
+                    amount: sub.amount,
+                    interval_seconds: sub.interval_seconds,
+                    last_payment_timestamp: sub.last_payment_timestamp,
+                    status: sub.status,
+                    prepaid_balance: sub.prepaid_balance,
+                    usage_enabled: sub.usage_enabled,
+                    lifetime_cap: sub.lifetime_cap,
+                    lifetime_charged: sub.lifetime_charged,
+                    start_time: sub.start_time,
+                    expires_at: sub.expires_at,
+                });
+
+                // Read merchant balance for the (merchant, token) pair referenced by this subscription.
+                let bal: i128 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::MerchantBalance(sub.merchant.clone(), sub.token.clone()))
+                    .unwrap_or(0i128);
+
+                balances.push_back(MerchantBalanceEntry {
+                    merchant: sub.merchant,
+                    token: sub.token,
+                    amount: bal,
+                });
+
+                exported += 1;
+            }
+            id += 1;
+        }
+
+        let next_start = if end_id < next_id { Some(end_id) } else { None };
+
+        env.events().publish(
+            (Symbol::new(&env, "snapshot_exported"),),
+            SnapshotExportedEvent {
+                admin,
+                start_id,
+                exported,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+
+        Ok(FullSnapshotPage {
+            subscriptions: subs,
+            balances,
+            next_start_id: next_start,
+        })
+    }
+
+    /// Restore a previously exported snapshot page. Admin only. Emergency stop must be active.
+    ///
+    /// This operation overwrites subscription records and merchant balances for the
+    /// provided entries. It updates `NextId` to at least the highest restored id+1.
+    pub fn restore_snapshot_page(
+        env: Env,
+        admin: Address,
+        start_id: u32,
+        subscriptions: Vec<SubscriptionSummary>,
+        balances: Vec<MerchantBalanceEntry>,
+        next_start_id: Option<u32>,
+    ) -> Result<(), Error> {
+        require_admin_auth(&env, &admin)?;
+        if !get_emergency_stop(&env) {
+            return Err(Error::RecoveryNotAllowed);
+        }
+
+        let mut restored: u32 = 0;
+        let mut max_next = env.storage().instance().get(&DataKey::NextId).unwrap_or(0u32);
+
+        // Write subscriptions into persistent storage.
+        let mut i = 0u32;
+        while (i as usize) < subscriptions.len() {
+            if let Some(s) = subscriptions.get(i) {
+                let sub = Subscription {
+                    subscriber: s.subscriber.clone(),
+                    merchant: s.merchant.clone(),
+                    token: s.token.clone(),
+                    amount: s.amount,
+                    interval_seconds: s.interval_seconds,
+                    last_payment_timestamp: s.last_payment_timestamp,
+                    status: s.status,
+                    prepaid_balance: s.prepaid_balance,
+                    usage_enabled: s.usage_enabled,
+                    lifetime_cap: s.lifetime_cap,
+                    lifetime_charged: s.lifetime_charged,
+                    start_time: s.start_time,
+                    expires_at: s.expires_at,
+                    grace_start_timestamp: None,
+                };
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::Sub(s.subscription_id), &sub);
+
+                restored = restored.saturating_add(1);
+                // adjust next id candidate
+                let candidate = s.subscription_id.saturating_add(1);
+                if candidate > max_next {
+                    max_next = candidate;
+                }
+            }
+            i += 1;
+        }
+
+        // Write merchant balances (instance storage)
+        let mut j = 0u32;
+        while (j as usize) < balances.len() {
+            if let Some(b) = balances.get(j) {
+                env.storage()
+                    .instance()
+                    .set(&DataKey::MerchantBalance(b.merchant.clone(), b.token.clone()), &b.amount);
+            }
+            j += 1;
+        }
+
+        // Ensure NextId is at least max_next
+        let current_next: u32 = env.storage().instance().get(&DataKey::NextId).unwrap_or(0u32);
+        if max_next > current_next {
+            env.storage().instance().set(&DataKey::NextId, &max_next);
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "snapshot_restored"),),
+            SnapshotRestoredEvent {
+                admin,
+                start_id,
+                restored,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+
+        Ok(())
+    }
+
     // ── Subscription Lifecycle ────────────────────────────────────────────────
 
     /// Create a new subscription.
@@ -1526,6 +1704,27 @@ impl SubscriptionVault {
         subscription::get_subscriber_exposure(&env, subscriber, token)
     }
 
+    /// Set the maximum number of active subscriptions allowed for a merchant. Admin only.
+    ///
+    /// The limit is checked during subscription creation. If the merchant's active
+    /// subscription count is greater than or equal to this limit, new subscription
+    /// creations are rejected with `Error::MaxConcurrentSubscriptionsReached`.
+    pub fn set_merchant_max_subs(
+        env: Env,
+        admin: Address,
+        merchant: Address,
+        max_subs: u32,
+    ) -> Result<(), Error> {
+        subscription::do_set_merchant_max_subs(&env, admin, merchant, max_subs)
+    }
+
+    /// Read the configured maximum subscription limit for a merchant.
+    ///
+    /// Returns `u32::MAX` when no limit is configured, meaning "no limit".
+    pub fn get_merchant_max_subs(env: Env, merchant: Address) -> u32 {
+        queries::get_merchant_max_subs(&env, merchant)
+    }
+
     /// Cancel the subscription. Allowed from Active, Paused, or InsufficientBalance.
     /// Transitions to the terminal `Cancelled` state.
     pub fn cancel_subscription(
@@ -1632,6 +1831,50 @@ impl SubscriptionVault {
     /// - `NotFound` if subscription doesn’t exist
     /// - `Unauthorized` if caller is not subscriber or merchant
     /// - `InvalidStatusTransition` if not active
+
+        /// Schedule a future cancellation for a subscription.
+        ///
+        /// On the next `charge_subscription` call where `now >= cancel_at`, the
+        /// subscription is transitioned to `Cancelled` and any remaining prepaid
+        /// balance is refunded instead of being charged.
+        ///
+        /// # Authorization
+        /// Only the subscription's `subscriber` or `merchant` may call this.
+        ///
+        /// # Errors
+        /// - `InvalidInput` if `cancel_at` is not strictly in the future
+        /// - `Forbidden` if caller is not subscriber or merchant
+        /// - `InvalidStatusTransition` if subscription is already `Cancelled`
+        /// - `SubscriptionExpired` if subscription has expired
+        pub fn schedule_cancel(
+            env: Env,
+            subscription_id: u32,
+            authorizer: Address,
+            cancel_at: u64,
+        ) -> Result<(), Error> {
+            let _guard = crate::reentrancy::ReentrancyGuard::lock(&env, "schedule_cancel")?;
+            subscription::do_schedule_cancel(&env, subscription_id, authorizer, cancel_at)
+        }
+
+        /// Clear a previously scheduled future cancellation.
+        ///
+        /// Idempotent: safe to call even when no cancellation was scheduled.
+        ///
+        /// # Authorization
+        /// Only the subscription's `subscriber` or `merchant` may call this.
+        ///
+        /// # Errors
+        /// - `Forbidden` if caller is not subscriber or merchant
+        /// - `InvalidStatusTransition` if subscription is already `Cancelled`
+        pub fn unschedule_cancel(
+            env: Env,
+            subscription_id: u32,
+            authorizer: Address,
+        ) -> Result<(), Error> {
+            let _guard = crate::reentrancy::ReentrancyGuard::lock(&env, "unschedule_cancel")?;
+            subscription::do_unschedule_cancel(&env, subscription_id, authorizer)
+        }
+
     pub fn pause_subscription(
         env: Env,
         subscription_id: u32,
@@ -1926,7 +2169,6 @@ impl SubscriptionVault {
         // Acquire reentrancy guard: prevents re-entry during token transfer
         let _guard = crate::reentrancy::ReentrancyGuard::lock(&env, "withdraw_merchant_funds")?;
 
-        let timestamp = env.ledger().timestamp();
         merchant::withdraw_merchant_funds(&env, merchant.clone(), amount)?;
 
         let new_balance = merchant::get_merchant_balance(&env, &merchant);
@@ -2237,6 +2479,7 @@ impl SubscriptionVault {
         merchant: Address,
         cap: Option<i128>,
     ) -> Result<(), Error> {
+        validation::reject_contract_self(&env, &merchant)?;
         subscription::do_set_merchant_cap_default(&env, merchant, cap)
     }
 
@@ -2332,6 +2575,7 @@ impl SubscriptionVault {
         token: Address,
         decimals: u32,
     ) -> Result<(), Error> {
+        validation::reject_contract_self(&env, &token)?;
         admin::add_accepted_token(&env, admin, token, decimals)
     }
 
@@ -2671,6 +2915,8 @@ impl SubscriptionVault {
         key: String,
         value: String,
     ) -> Result<(), Error> {
+        validation::reject_empty_string(&key)?;
+        validation::reject_empty_string(&value)?;
         metadata::set_metadata(&env, subscription_id, &authorizer, key, value)
     }
 
@@ -2701,6 +2947,7 @@ impl SubscriptionVault {
         authorizer: Address,
         key: String,
     ) -> Result<(), Error> {
+        validation::reject_empty_string(&key)?;
         metadata::delete_metadata(&env, subscription_id, &authorizer, key)
     }
 
@@ -2745,6 +2992,7 @@ impl SubscriptionVault {
         treasury: Address,
         fee_bps: u32,
     ) -> Result<(), Error> {
+        validation::reject_contract_self(&env, &treasury)?;
         admin::set_protocol_fee(&env, admin, treasury, fee_bps)
     }
 
@@ -3021,15 +3269,21 @@ mod test_utils;
 mod test_charge_invariants;
 
 #[cfg(test)]
-mod test_payout_schedule;
+mod test_scheduled_cancel;
 
 #[cfg(test)]
 mod test_billing_period_snapshots;
-#[cfg(test)]
-mod test_insufficient_balance;
 
 #[cfg(test)]
-mod test_idempotency_keys;
+mod test_insufficient_balance;
+#[cfg(test)]
+mod test_governance;
+
+#[cfg(test)]
+mod test_validation;
+
+#[cfg(test)]
+mod test_abi_validators_integration;
 
 #[cfg(test)]
 mod test {

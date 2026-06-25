@@ -42,11 +42,12 @@ use crate::safe_math::{safe_add, safe_add_balance, safe_sub};
 use crate::state_machine::transition_to;
 use crate::statements::append_statement;
 use crate::types::{
-    BillingChargeKind, DataKey, Error, FundsDepositedEvent,
+    BillingChargeKind, ChargeFailureEvent, DataKey, Error, FundsDepositedEvent,
     GlobalCapDefaultUpdatedEvent, LifetimeCapReachedEvent, LifetimeCapUpdatedEvent,
     MerchantCapDefaultUpdatedEvent, PartialRefundEvent, PlanMaxActiveUpdatedEvent,
     PlanTemplate, PlanTemplateUpdatedEvent, SubscriberWithdrawalEvent,
-    Subscription, SubscriptionCancelledEvent, SubscriptionCreatedEvent, SubscriptionMigratedEvent,
+    Subscription, SubscriptionCancelledEvent, SubscriptionCancelScheduledEvent, SubscriptionCancelUnscheduledEvent,
+    SubscriptionCreatedEvent, SubscriptionMigratedEvent,
     SubscriptionRecoveryReadyEvent, SubscriptionResumedEvent, SubscriptionPausedEvent,
     SubscriptionStatus, UsageLimits, UsageLimitsConfiguredEvent,
     SUB_TTL_EXTEND_TO, SUB_TTL_THRESHOLD,
@@ -363,6 +364,13 @@ pub fn do_create_subscription_with_token(
     crate::blocklist::require_not_blocklisted(env, &subscriber)?;
     crate::blocklist::require_not_blocklisted(env, &merchant)?;
 
+    // Enforce per-merchant active subscription limit.
+    let active_count = crate::queries::get_merchant_subscription_count(env, merchant.clone());
+    let max_subs = crate::queries::get_merchant_max_subs(env, merchant.clone());
+    if active_count >= max_subs {
+        return Err(Error::MaxConcurrentSubscriptionsReached);
+    }
+
     if amount < 0 {
         return Err(Error::InvalidAmount);
     }
@@ -406,6 +414,7 @@ pub fn do_create_subscription_with_token(
         start_time: env.ledger().timestamp(),
         expires_at,
         grace_start_timestamp: None,
+        cancel_at: None,
     };
 
     // Allocate ID with overflow / limit guard.
@@ -644,7 +653,8 @@ pub fn do_cancel_subscription(
     let merchant_key = DataKey::MerchantSubs(sub.merchant.clone());
     if let Some(mut ids) = env.storage().instance().get::<_, Vec<u32>>(&merchant_key) {
         if let Some(idx) = ids.iter().position(|x| x == subscription_id) {
-            ids.remove(idx.try_into().unwrap());
+            let idx_u32 = idx.try_into().map_err(|_| Error::Overflow)?;
+            ids.remove(idx_u32);
             env.storage().instance().set(&merchant_key, &ids);
         }
     }
@@ -652,7 +662,8 @@ pub fn do_cancel_subscription(
     let token_key = DataKey::TokenSubs(sub.token.clone());
     if let Some(mut ids) = env.storage().instance().get::<_, Vec<u32>>(&token_key) {
         if let Some(idx) = ids.iter().position(|x| x == subscription_id) {
-            ids.remove(idx.try_into().unwrap());
+            let idx_u32 = idx.try_into().map_err(|_| Error::Overflow)?;
+            ids.remove(idx_u32);
             env.storage().instance().set(&token_key, &ids);
         }
     }
@@ -661,7 +672,8 @@ pub fn do_cancel_subscription(
     let subscriber_key = DataKey::SubscriberSubs(sub.subscriber.clone());
     if let Some(mut ids) = env.storage().instance().get::<_, Vec<u32>>(&subscriber_key) {
         if let Some(idx) = ids.iter().position(|x| x == subscription_id) {
-            ids.remove(idx.try_into().unwrap());
+            let idx_u32 = idx.try_into().map_err(|_| Error::Overflow)?;
+            ids.remove(idx_u32);
             env.storage().instance().set(&subscriber_key, &ids);
         }
     }
@@ -681,6 +693,102 @@ pub fn do_cancel_subscription(
     );
     Ok(())
 }
+
+/// Schedule a future cancellation for a subscription.
+///
+/// When `now >= cancel_at` on the next `charge_one` call, the subscription is
+/// automatically transitioned to `Cancelled` instead of being charged.
+///
+/// # Authorization
+/// Only the subscription's `subscriber` or `merchant` may schedule.
+///
+/// # Validation
+/// - `cancel_at` must be strictly greater than the current ledger timestamp.
+/// - Subscription must not already be `Cancelled` or `Expired`.
+///
+/// # Events
+/// Emits [`SubscriptionCancelScheduledEvent`].
+pub fn do_schedule_cancel(
+    env: &Env,
+    subscription_id: u32,
+    authorizer: Address,
+    cancel_at: u64,
+) -> Result<(), Error> {
+    authorizer.require_auth();
+
+    let now = env.ledger().timestamp();
+    if cancel_at <= now {
+        return Err(Error::InvalidInput);
+    }
+
+    let mut sub = get_subscription(env, subscription_id)?;
+
+    if authorizer != sub.subscriber && authorizer != sub.merchant {
+        return Err(Error::Forbidden);
+    }
+
+    if sub.status == SubscriptionStatus::Cancelled {
+        return Err(Error::InvalidStatusTransition);
+    }
+    if sub.is_expired(now) {
+        return Err(Error::SubscriptionExpired);
+    }
+
+    sub.cancel_at = Some(cancel_at);
+    write_subscription(env, subscription_id, &sub);
+
+    env.events().publish(
+        (Symbol::new(env, "cancel_scheduled"), subscription_id),
+        SubscriptionCancelScheduledEvent {
+            subscription_id,
+            cancel_at,
+            scheduled_by: authorizer,
+            timestamp: now,
+        },
+    );
+    Ok(())
+}
+
+/// Clear a previously scheduled future cancellation.
+///
+/// Safe to call even when no cancellation was scheduled (idempotent).
+///
+/// # Authorization
+/// Only the subscription's `subscriber` or `merchant` may unschedule.
+///
+/// # Events
+/// Emits [`SubscriptionCancelUnscheduledEvent`].
+pub fn do_unschedule_cancel(
+    env: &Env,
+    subscription_id: u32,
+    authorizer: Address,
+) -> Result<(), Error> {
+    authorizer.require_auth();
+
+    let mut sub = get_subscription(env, subscription_id)?;
+
+    if authorizer != sub.subscriber && authorizer != sub.merchant {
+        return Err(Error::Forbidden);
+    }
+
+    if sub.status == SubscriptionStatus::Cancelled {
+        return Err(Error::InvalidStatusTransition);
+    }
+
+    sub.cancel_at = None;
+    write_subscription(env, subscription_id, &sub);
+
+    env.events().publish(
+        (Symbol::new(env, "cancel_unscheduled"), subscription_id),
+        SubscriptionCancelUnscheduledEvent {
+            subscription_id,
+            unscheduled_by: authorizer,
+            timestamp: env.ledger().timestamp(),
+        },
+    );
+    Ok(())
+}
+
 
 /// Pause a subscription (no charges until resumed).
 ///
@@ -1436,6 +1544,13 @@ pub fn do_create_subscription_from_plan(
         return Err(Error::InvalidInput);
     }
 
+    // Enforce per-merchant active subscription limit.
+    let active_count = crate::queries::get_merchant_subscription_count(env, plan.merchant.clone());
+    let max_subs = crate::queries::get_merchant_max_subs(env, plan.merchant.clone());
+    if active_count >= max_subs {
+        return Err(Error::MaxConcurrentSubscriptionsReached);
+    }
+
     // Enforce subscriber-level credit limit for the plan's token.
     enforce_credit_limit_for_delta(env, &subscriber, &plan.token, plan.amount)?;
 
@@ -1462,6 +1577,7 @@ pub fn do_create_subscription_from_plan(
         start_time: env.ledger().timestamp(),
         expires_at: None,
         grace_start_timestamp: None,
+        cancel_at: None,
     };
 
     write_subscription(env, id, &sub);
@@ -1754,6 +1870,30 @@ pub fn do_set_subscriber_credit_limit(
     env.storage()
         .instance()
         .set(&credit_limit_key(&subscriber, &token), &limit);
+
+    Ok(())
+}
+
+pub fn do_set_merchant_max_subs(
+    env: &Env,
+    admin: Address,
+    merchant: Address,
+    max_subs: u32,
+) -> Result<(), Error> {
+    super::require_admin_auth(env, &admin)?;
+
+    env.storage()
+        .instance()
+        .set(&DataKey::MerchantMaxSubs(merchant.clone()), &max_subs);
+
+    env.events().publish(
+        (Symbol::new(env, "merchant_max_subs_updated"), merchant.clone()),
+        crate::types::MerchantMaxSubsUpdatedEvent {
+            merchant,
+            max_subs,
+            timestamp: env.ledger().timestamp(),
+        },
+    );
 
     Ok(())
 }

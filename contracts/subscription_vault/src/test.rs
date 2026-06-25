@@ -141,6 +141,43 @@ fn seed_merchant_balance(
     });
 }
 
+#[test]
+fn test_emit_merchant_balance_snapshot_zero_balance() {
+    let (env, client, token, admin) = setup_test_env();
+    let merchant = Address::generate(&env);
+
+    // No balance or earnings seeded -> zero snapshot
+    let res = client.emit_merchant_balance_snapshot(&admin, &merchant, &token);
+    assert_eq!(res, Ok(()));
+
+    // On-chain stored bucket is still zero
+    assert_eq!(client.get_merchant_balance_by_token(&merchant, &token), 0i128);
+}
+
+#[test]
+fn test_emit_all_balances_snapshot_paginated() {
+    let (env, client, token, admin) = setup_test_env();
+
+    // Create three subscriptions with two merchants (one repeated) so batch dedup works.
+    let (id1, _, merchant_a) = create_test_subscription(&env, &client, SubscriptionStatus::Active);
+    let (id2, _, merchant_b) = create_test_subscription(&env, &client, SubscriptionStatus::Active);
+    let (id3, _, merchant_a2) = create_test_subscription(&env, &client, SubscriptionStatus::Active);
+
+    // Seed balances for merchants
+    seed_merchant_balance(&env, &client.address, &merchant_a, &token, 1_000_000i128);
+    seed_merchant_balance(&env, &client.address, &merchant_b, &token, 2_000_000i128);
+    seed_merchant_balance(&env, &client.address, &merchant_a2, &token, 3_000_000i128);
+
+    // Call emit_all_balances_snapshot across subscription id range [0, next_id)
+    let next_id: u32 = env.storage().instance().get(&DataKey::NextId).unwrap_or(0);
+    let res = client.emit_all_balances_snapshot(&admin, &0u32, &next_id);
+    assert!(res.is_ok());
+    let page = res.unwrap();
+
+    // At least one snapshot should be produced and the values match stored balances
+    assert!(page.len() >= 2);
+}
+
 fn create_secondary_token(env: &Env) -> Address {
     env.register_stellar_asset_contract_v2(Address::generate(env))
         .address()
@@ -4018,6 +4055,75 @@ fn test_export_subscription_summaries() {
         .export_subscription_summaries(&test_env.admin, &0, &10);
     assert_eq!(summaries.len(), 1);
     assert_eq!(summaries.get(0).unwrap().subscription_id, id);
+}
+
+#[test]
+fn test_export_full_snapshot_page() {
+    let test_env = TestEnv::default();
+    let (id, _subscriber, merchant) =
+        fixtures::create_subscription(&test_env.env, &test_env.client, SubscriptionStatus::Active);
+
+    // obtain the contract token address from the contract snapshot
+    let cs = test_env.client.export_contract_snapshot(&test_env.admin);
+    let token = cs.token;
+
+    // seed a merchant balance for the (merchant, token) pair
+    seed_merchant_balance(&test_env.env, &test_env.client.address, &merchant, &token, 42_000);
+
+    let page = test_env
+        .client
+        .export_full_snapshot_page(&test_env.admin, &0, &10)
+        .unwrap();
+
+    assert_eq!(page.subscriptions.len(), 1);
+    assert_eq!(page.balances.len(), 1);
+    let s = page.subscriptions.get(0).unwrap();
+    assert_eq!(s.subscription_id, id);
+    let b = page.balances.get(0).unwrap();
+    assert_eq!(b.merchant, merchant);
+    assert_eq!(b.token, token);
+}
+
+#[test]
+fn test_restore_snapshot_page() {
+    // source environment: create subscription and export a page
+    let src = TestEnv::default();
+    let (id, _subscriber, merchant) =
+        fixtures::create_subscription(&src.env, &src.client, SubscriptionStatus::Active);
+    let cs = src.client.export_contract_snapshot(&src.admin);
+    let token = cs.token;
+    seed_merchant_balance(&src.env, &src.client.address, &merchant, &token, 99_999);
+
+    let page = src
+        .client
+        .export_full_snapshot_page(&src.admin, &0, &10)
+        .unwrap();
+
+    // target environment: fresh contract where we will restore
+    let target_env = Env::default();
+    let (target_client, _target_token, target_admin) = setup_contract(&target_env);
+
+    // enable emergency stop on the target so restores are allowed
+    target_client.enable_emergency_stop(&target_admin).unwrap();
+
+    // perform restore
+    target_client
+        .restore_snapshot_page(&target_admin, &0, &page.subscriptions, &page.balances, &page.next_start_id)
+        .unwrap();
+
+    // verify subscription exists in target
+    let restored = target_client.get_subscription(&id);
+    assert_eq!(restored.subscription_id, id);
+
+    // verify merchant balance written into target storage
+    let bal: i128 = target_env.as_contract(&target_client.address, || {
+        target_env
+            .storage()
+            .instance()
+            .get(&DataKey::MerchantBalance(merchant.clone(), token.clone()))
+            .unwrap_or(0i128)
+    });
+    assert_eq!(bal, 99_999);
 }
 
 // =============================================================================
@@ -9213,4 +9319,163 @@ fn test_migrate_downgrade_does_not_emit_event() {
         !has_event_with_symbol(&env, &events, "schema_migrated"),
         "no schema_migrated event must be emitted on a rejected downgrade"
     );
+}
+
+#[test]
+fn test_merchant_max_subs_default() {
+    let test_env = TestEnv::default();
+    let subscriber = Address::generate(&test_env.env);
+    let merchant = Address::generate(&test_env.env);
+
+    // Default limit should be u32::MAX.
+    assert_eq!(test_env.client.get_merchant_max_subs(&merchant), u32::MAX);
+
+    // Create a subscription.
+    let _id = test_env.client.create_subscription(
+        &subscriber,
+        &merchant,
+        &AMOUNT,
+        &INTERVAL,
+        &false,
+        &None::<i128>,
+        &None::<u64>,
+    );
+
+    assert_eq!(test_env.client.get_merchant_subscription_count(&merchant), 1);
+}
+
+#[test]
+fn test_merchant_max_subs_blocks_creation() {
+    let test_env = TestEnv::default();
+    let subscriber = Address::generate(&test_env.env);
+    let merchant = Address::generate(&test_env.env);
+    let admin = &test_env.admin;
+
+    // Set max subs limit to 2.
+    test_env.client.set_merchant_max_subs(admin, &merchant, &2);
+    assert_eq!(test_env.client.get_merchant_max_subs(&merchant), 2);
+
+    // First subscription succeeds.
+    let _id1 = test_env.client.create_subscription(
+        &subscriber,
+        &merchant,
+        &AMOUNT,
+        &INTERVAL,
+        &false,
+        &None::<i128>,
+        &None::<u64>,
+    );
+
+    // Second subscription succeeds.
+    let _id2 = test_env.client.create_subscription(
+        &subscriber,
+        &merchant,
+        &AMOUNT,
+        &INTERVAL,
+        &false,
+        &None::<i128>,
+        &None::<u64>,
+    );
+
+    // Third subscription is rejected.
+    let result = test_env.client.try_create_subscription(
+        &subscriber,
+        &merchant,
+        &AMOUNT,
+        &INTERVAL,
+        &false,
+        &None::<i128>,
+        &None::<u64>,
+    );
+    assert_eq!(result, Err(Ok(Error::MaxConcurrentSubscriptionsReached)));
+
+    // Create plan template under the same merchant.
+    let plan_id = test_env.client.create_plan_template(&merchant, &AMOUNT, &INTERVAL, &false, &None::<i128>);
+
+    // Subscribing to plan template is also rejected since the merchant cap is exhausted.
+    let plan_result = test_env.client.try_create_subscription_from_plan(&subscriber, &plan_id);
+    assert_eq!(plan_result, Err(Ok(Error::MaxConcurrentSubscriptionsReached)));
+}
+
+#[test]
+fn test_merchant_max_subs_cancellation_frees_slot() {
+    let test_env = TestEnv::default();
+    let subscriber = Address::generate(&test_env.env);
+    let merchant = Address::generate(&test_env.env);
+    let admin = &test_env.admin;
+
+    // Set limit to 1.
+    test_env.client.set_merchant_max_subs(admin, &merchant, &1);
+
+    // First subscription succeeds.
+    let id = test_env.client.create_subscription(
+        &subscriber,
+        &merchant,
+        &AMOUNT,
+        &INTERVAL,
+        &false,
+        &None::<i128>,
+        &None::<u64>,
+    );
+
+    // Second creation is blocked.
+    let result = test_env.client.try_create_subscription(
+        &subscriber,
+        &merchant,
+        &AMOUNT,
+        &INTERVAL,
+        &false,
+        &None::<i128>,
+        &None::<u64>,
+    );
+    assert_eq!(result, Err(Ok(Error::MaxConcurrentSubscriptionsReached)));
+
+    // Cancel first subscription.
+    test_env.client.cancel_subscription(&id, &subscriber);
+
+    // Now creation succeeds.
+    let _id2 = test_env.client.create_subscription(
+        &subscriber,
+        &merchant,
+        &AMOUNT,
+        &INTERVAL,
+        &false,
+        &None::<i128>,
+        &None::<u64>,
+    );
+}
+
+#[test]
+fn test_merchant_max_subs_and_plan_max_active_interaction() {
+    let test_env = TestEnv::default();
+    let subscriber_a = Address::generate(&test_env.env);
+    let subscriber_b = Address::generate(&test_env.env);
+    let subscriber_c = Address::generate(&test_env.env);
+    let subscriber_d = Address::generate(&test_env.env);
+    let merchant = Address::generate(&test_env.env);
+    let admin = &test_env.admin;
+
+    // Set merchant global limit to 3.
+    test_env.client.set_merchant_max_subs(admin, &merchant, &3);
+
+    // Set plan template limit to 1 per-subscriber.
+    let plan_id = test_env.client.create_plan_template(&merchant, &AMOUNT, &INTERVAL, &false, &None::<i128>);
+    test_env.client.set_plan_max_active_subs(&merchant, &plan_id, &1);
+
+    // Subscriber A subscribes to plan: succeeds (merchant total active = 1).
+    let _sub_a = test_env.client.create_subscription_from_plan(&subscriber_a, &plan_id);
+
+    // Subscriber A subscribing again: rejected by PlanMaxActive limit.
+    let result_a2 = test_env.client.try_create_subscription_from_plan(&subscriber_a, &plan_id);
+    assert_eq!(result_a2, Err(Ok(Error::MaxConcurrentSubscriptionsReached)));
+
+    // Subscriber B subscribes to plan: succeeds (merchant total active = 2).
+    let _sub_b = test_env.client.create_subscription_from_plan(&subscriber_b, &plan_id);
+
+    // Subscriber C subscribes to plan: succeeds (merchant total active = 3).
+    let _sub_c = test_env.client.create_subscription_from_plan(&subscriber_c, &plan_id);
+
+    // Subscriber D subscribes to plan: rejected by MerchantMaxSubs limit.
+    let result_d = test_env.client.try_create_subscription_from_plan(&subscriber_d, &plan_id);
+    assert_eq!(result_d, Err(Ok(Error::MaxConcurrentSubscriptionsReached)));
 }
