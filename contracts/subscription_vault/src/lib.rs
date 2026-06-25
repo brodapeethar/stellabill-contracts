@@ -116,7 +116,6 @@ pub mod statements {
 }
 
 
-
 /// Accounting: tracks total tokens accounted for across all subscriptions.
 ///
 /// # Invariant
@@ -3030,9 +3029,10 @@ mod test_payout_schedule;
 
 #[cfg(test)]
 mod test_billing_period_snapshots;
-
 #[cfg(test)]
 mod test_insufficient_balance;
+#[cfg(test)]
+mod test_governance;
 
 #[cfg(test)]
 mod test_validation;

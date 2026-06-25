@@ -644,7 +644,8 @@ pub fn do_cancel_subscription(
     let merchant_key = DataKey::MerchantSubs(sub.merchant.clone());
     if let Some(mut ids) = env.storage().instance().get::<_, Vec<u32>>(&merchant_key) {
         if let Some(idx) = ids.iter().position(|x| x == subscription_id) {
-            ids.remove(idx.try_into().unwrap());
+            let idx_u32 = idx.try_into().map_err(|_| Error::Overflow)?;
+            ids.remove(idx_u32);
             env.storage().instance().set(&merchant_key, &ids);
         }
     }
@@ -652,7 +653,8 @@ pub fn do_cancel_subscription(
     let token_key = DataKey::TokenSubs(sub.token.clone());
     if let Some(mut ids) = env.storage().instance().get::<_, Vec<u32>>(&token_key) {
         if let Some(idx) = ids.iter().position(|x| x == subscription_id) {
-            ids.remove(idx.try_into().unwrap());
+            let idx_u32 = idx.try_into().map_err(|_| Error::Overflow)?;
+            ids.remove(idx_u32);
             env.storage().instance().set(&token_key, &ids);
         }
     }
@@ -661,7 +663,8 @@ pub fn do_cancel_subscription(
     let subscriber_key = DataKey::SubscriberSubs(sub.subscriber.clone());
     if let Some(mut ids) = env.storage().instance().get::<_, Vec<u32>>(&subscriber_key) {
         if let Some(idx) = ids.iter().position(|x| x == subscription_id) {
-            ids.remove(idx.try_into().unwrap());
+            let idx_u32 = idx.try_into().map_err(|_| Error::Overflow)?;
+            ids.remove(idx_u32);
             env.storage().instance().set(&subscriber_key, &ids);
         }
     }

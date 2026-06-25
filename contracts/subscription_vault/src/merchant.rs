@@ -366,6 +366,9 @@ pub fn withdraw_merchant_funds_for_token(
         return Err(Error::InvalidInput);
     }
 
+    // Verify merchant config is initialized
+    let _config = get_merchant_config(env, merchant.clone()).ok_or(Error::NotFound)?;
+
     let current = get_merchant_balance_by_token(env, &merchant, &token_addr);
     if current == 0 {
         return Err(Error::NotFound);
@@ -431,6 +434,9 @@ pub fn merchant_refund(
     if amount <= 0 {
         return Err(Error::InvalidAmount);
     }
+
+    // Verify merchant config is initialized
+    let _config = get_merchant_config(env, merchant.clone()).ok_or(Error::NotFound)?;
 
     let current = get_merchant_balance_by_token(env, &merchant, &token_addr);
     if current == 0 {
