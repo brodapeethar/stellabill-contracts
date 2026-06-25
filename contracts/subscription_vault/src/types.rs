@@ -1817,64 +1817,28 @@ pub struct PrepaidQueryResult {
     pub has_more: bool,
 }
 
-/// Normalize any token's amount to a 9-decimal base (1e9 internal) using `DataKey::TokenDecimals`.
+
+/// Event emitted on **every** failed charge attempt, regardless of error type.
 ///
-/// Returns `Error::InvalidTokenDecimals` if decimals is 0.
-/// Returns `Error::Overflow` on multiplier overflow.
-/// Returns `Error::InvalidInput` on precision loss if decimals > 9.
-pub fn normalize_amount(env: &Env, token: &Address, raw: i128) -> Result<i128, Error> {
-    let decimals: u32 = env
-        .storage()
-        .instance()
-        .get(&DataKey::TokenDecimals(token.clone()))
-        .ok_or(Error::InvalidToken)?;
-
-    if decimals == 0 {
-        return Err(Error::InvalidTokenDecimals);
-    }
-
-    if decimals <= 9 {
-        let diff = 9 - decimals;
-        let factor = 10_i128.pow(diff);
-        raw.checked_mul(factor).ok_or(Error::Overflow)
-    } else {
-        let diff = decimals - 9;
-        let factor = 10_i128.pow(diff);
-        if raw % factor != 0 {
-            return Err(Error::InvalidInput);
-        }
-        Ok(raw / factor)
-    }
-}
-
-/// Denormalize any token's amount from a 9-decimal base (1e9 internal) back to its raw decimals.
+/// Unlike [`SubscriptionChargeFailedEvent`] (which fires only on balance-shortfall
+/// paths), this event is emitted for all `Err(_)` returns from charge entry-points —
+/// including `IntervalNotElapsed`, `MerchantPaused`, `EmergencyStopActive`,
+/// `OraclePriceStale`, `SubscriptionExpired`, and others.
 ///
-/// Returns `Error::InvalidTokenDecimals` if decimals is 0.
-/// Returns `Error::Overflow` on multiplier overflow.
-/// Returns `Error::InvalidInput` on precision loss if decimals < 9.
-pub fn denormalize_amount(env: &Env, token: &Address, normalized: i128) -> Result<i128, Error> {
-    let decimals: u32 = env
-        .storage()
-        .instance()
-        .get(&DataKey::TokenDecimals(token.clone()))
-        .ok_or(Error::InvalidToken)?;
-
-    if decimals == 0 {
-        return Err(Error::InvalidTokenDecimals);
-    }
-
-    if decimals <= 9 {
-        let diff = 9 - decimals;
-        let factor = 10_i128.pow(diff);
-        if normalized % factor != 0 {
-            return Err(Error::InvalidInput);
-        }
-        Ok(normalized / factor)
-    } else {
-        let diff = decimals - 9;
-        let factor = 10_i128.pow(diff);
-        normalized.checked_mul(factor).ok_or(Error::Overflow)
-    }
+/// The `error_code` field maps directly to the numeric value of [`Error`]
+/// (see `docs/errors.md`) so indexers can group failure rates by error range
+/// without decoding enum variants.
+///
+/// **Topic:** `("charge_failed_v2", subscription_id)`
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ChargeFailureEvent {
+    /// Subscription that failed to be charged.
+    pub subscription_id: u32,
+    /// Numeric error code (see [`Error::to_code`] and `docs/errors.md`).
+    pub error_code: u32,
+    /// Amount that would have been charged (0 when not yet determined).
+    pub attempted_amount: i128,
+    /// Ledger timestamp at the time of the failure.
+    pub ledger: u64,
 }
-
-
