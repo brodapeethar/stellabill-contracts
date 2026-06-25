@@ -3,10 +3,7 @@
 //! Kept in a separate module to reduce merge conflicts when editing state machine
 //! or contract entrypoints.
 
-use soroban_sdk::{contracterror, contracttype, Address, BytesN, String, Vec};
-
-/// Version of the append-only event payload schema consumed by indexers.
-pub const EVENT_SCHEMA_VERSION: u32 = 2;
+use soroban_sdk::{contracterror, contracttype, Address, Env, String, Vec};
 
 /// Maximum number of metadata keys per subscription.
 pub const MAX_METADATA_KEYS: u32 = 10;
@@ -1625,6 +1622,11 @@ pub struct TokenLiabilities {
     pub computed_total: i128,
     /// Whether the accounting equation balances (contract_balance == computed_total).
     pub is_balanced: bool,
+    pub normalized_prepaid: i128,
+    pub normalized_merchant_liab: i128,
+    pub normalized_recoverable: i128,
+    pub normalized_contract_balance: i128,
+    pub normalized_computed_total: i128,
 }
 
 /// Paginated result for reconciliation queries across all tokens.
@@ -1694,34 +1696,64 @@ pub struct PrepaidQueryResult {
     pub has_more: bool,
 }
 
-// ── Idempotency Key Ring Buffer ─────────────────────────────────────────────
-
-/// Maximum number of idempotency keys retained per subscription.
-pub const IDEM_HISTORY: u32 = 32;
-
-/// Entrypoint domains for idempotency key scoping.
+/// Normalize any token's amount to a 9-decimal base (1e9 internal) using `DataKey::TokenDecimals`.
 ///
-/// Each entrypoint type uses a unique domain so that the same raw key supplied
-/// to `charge_subscription` vs `deposit_funds` produces a different on-chain
-/// fingerprint and cannot accidentally replay across operations.
-pub const DOMAIN_CHARGE_INTERVAL: u32 = 0;
-pub const DOMAIN_DEPOSIT_FUNDS: u32 = 1;
-pub const DOMAIN_CHARGE_ONEOFF: u32 = 2;
+/// Returns `Error::InvalidTokenDecimals` if decimals is 0.
+/// Returns `Error::Overflow` on multiplier overflow.
+/// Returns `Error::InvalidInput` on precision loss if decimals > 9.
+pub fn normalize_amount(env: &Env, token: &Address, raw: i128) -> Result<i128, Error> {
+    let decimals: u32 = env
+        .storage()
+        .instance()
+        .get(&DataKey::TokenDecimals(token.clone()))
+        .ok_or(Error::InvalidToken)?;
 
-/// Ring buffer of recently-seen idempotency key hashes for one subscription.
-///
-/// `DataKey::IdemKey(subscription_id)` stores this structure so that the same
-/// caller-supplied key is recognised within `IDEM_HISTORY` consecutive charges
-/// and rejected with `Error::Replay`.
-///
-/// # Eviction
-/// When the buffer is full the next push overwrites the oldest entry (cursor
-/// wraps around). The caller must therefore ensure their retry window does not
-/// exceed `IDEM_HISTORY` operations for a single subscription.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct IdemRingBuffer {
-    pub entries: Vec<BytesN<32>>,
-    pub cursor: u32,
+    if decimals == 0 {
+        return Err(Error::InvalidTokenDecimals);
+    }
+
+    if decimals <= 9 {
+        let diff = 9 - decimals;
+        let factor = 10_i128.pow(diff);
+        raw.checked_mul(factor).ok_or(Error::Overflow)
+    } else {
+        let diff = decimals - 9;
+        let factor = 10_i128.pow(diff);
+        if raw % factor != 0 {
+            return Err(Error::InvalidInput);
+        }
+        Ok(raw / factor)
+    }
 }
+
+/// Denormalize any token's amount from a 9-decimal base (1e9 internal) back to its raw decimals.
+///
+/// Returns `Error::InvalidTokenDecimals` if decimals is 0.
+/// Returns `Error::Overflow` on multiplier overflow.
+/// Returns `Error::InvalidInput` on precision loss if decimals < 9.
+pub fn denormalize_amount(env: &Env, token: &Address, normalized: i128) -> Result<i128, Error> {
+    let decimals: u32 = env
+        .storage()
+        .instance()
+        .get(&DataKey::TokenDecimals(token.clone()))
+        .ok_or(Error::InvalidToken)?;
+
+    if decimals == 0 {
+        return Err(Error::InvalidTokenDecimals);
+    }
+
+    if decimals <= 9 {
+        let diff = 9 - decimals;
+        let factor = 10_i128.pow(diff);
+        if normalized % factor != 0 {
+            return Err(Error::InvalidInput);
+        }
+        Ok(normalized / factor)
+    } else {
+        let diff = decimals - 9;
+        let factor = 10_i128.pow(diff);
+        normalized.checked_mul(factor).ok_or(Error::Overflow)
+    }
+}
+
 

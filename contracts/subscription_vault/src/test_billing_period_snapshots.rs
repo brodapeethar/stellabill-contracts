@@ -12,7 +12,7 @@ fn setup() -> (Env, Address) {
     let env = Env::default();
     env.ledger().set_timestamp(1_000_000);
     let contract_id = env.register(SubscriptionVault, ());
-    (env, contract_id)
+    (env, contract_id) 
 }
 
 #[test]
@@ -176,10 +176,7 @@ fn test_integrity_checks() {
         status_flags: SNAPSHOT_FLAG_USAGE_CHARGED,
         finalized_at: 150,
     };
-    assert_eq!(
-        env.as_contract(&contract_id, || write_period_snapshot(&env, bad_bounds)),
-        Err(Error::InvalidInput)
-    );
+    assert_eq!(env.as_contract(&contract_id, || write_period_snapshot(&env, bad_bounds)), Err(Error::InvalidInput));
 
     // Interval charge requires period_start < period_end
     let bad_interval = BillingPeriodSnapshot {
@@ -192,8 +189,5 @@ fn test_integrity_checks() {
         status_flags: SNAPSHOT_FLAG_INTERVAL_CHARGED,
         finalized_at: 100,
     };
-    assert_eq!(
-        env.as_contract(&contract_id, || write_period_snapshot(&env, bad_interval)),
-        Err(Error::InvalidInput)
-    );
+    assert_eq!(env.as_contract(&contract_id, || write_period_snapshot(&env, bad_interval)), Err(Error::InvalidInput));
 }

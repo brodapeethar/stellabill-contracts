@@ -114,9 +114,6 @@ pub mod statements {
     }
 }
 
-// ── Period snapshots (stub — separated into own file) ───────────────────────
-// The actual implementation lives in `period_snapshots.rs`.  The module is
-// declared at the top of this file.
 
 /// Accounting: tracks total tokens accounted for across all subscriptions.
 ///
@@ -3029,7 +3026,7 @@ mod test_billing_period_snapshots;
 mod test_insufficient_balance;
 
 #[cfg(test)]
-mod test_idempotency_keys;
+mod test_decimal_normalization;
 
 #[cfg(test)]
 mod test {
