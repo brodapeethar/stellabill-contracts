@@ -22,6 +22,7 @@ mod queries;
 mod safe_math;
 mod subscription;
 mod types;
+mod validation;
 pub mod period_snapshots;
 
 pub use safe_math::*;
@@ -113,6 +114,7 @@ pub mod statements {
         })
     }
 }
+
 
 
 /// Accounting: tracks total tokens accounted for across all subscriptions.
@@ -2234,6 +2236,7 @@ impl SubscriptionVault {
         merchant: Address,
         cap: Option<i128>,
     ) -> Result<(), Error> {
+        validation::reject_contract_self(&env, &merchant)?;
         subscription::do_set_merchant_cap_default(&env, merchant, cap)
     }
 
@@ -2329,6 +2332,7 @@ impl SubscriptionVault {
         token: Address,
         decimals: u32,
     ) -> Result<(), Error> {
+        validation::reject_contract_self(&env, &token)?;
         admin::add_accepted_token(&env, admin, token, decimals)
     }
 
@@ -2668,6 +2672,8 @@ impl SubscriptionVault {
         key: String,
         value: String,
     ) -> Result<(), Error> {
+        validation::reject_empty_string(&key)?;
+        validation::reject_empty_string(&value)?;
         metadata::set_metadata(&env, subscription_id, &authorizer, key, value)
     }
 
@@ -2698,6 +2704,7 @@ impl SubscriptionVault {
         authorizer: Address,
         key: String,
     ) -> Result<(), Error> {
+        validation::reject_empty_string(&key)?;
         metadata::delete_metadata(&env, subscription_id, &authorizer, key)
     }
 
@@ -2742,6 +2749,7 @@ impl SubscriptionVault {
         treasury: Address,
         fee_bps: u32,
     ) -> Result<(), Error> {
+        validation::reject_contract_self(&env, &treasury)?;
         admin::set_protocol_fee(&env, admin, treasury, fee_bps)
     }
 
@@ -3022,11 +3030,15 @@ mod test_payout_schedule;
 
 #[cfg(test)]
 mod test_billing_period_snapshots;
+
 #[cfg(test)]
 mod test_insufficient_balance;
 
 #[cfg(test)]
-mod test_decimal_normalization;
+mod test_validation;
+
+#[cfg(test)]
+mod test_abi_validators_integration;
 
 #[cfg(test)]
 mod test {
